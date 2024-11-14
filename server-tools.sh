@@ -27,7 +27,7 @@ install_certbot() {
     return 0
 }
 
-# Neue Funktion: SSH-User erstellen
+#  Funktion: SSH-User erstellen
 create_ssh_user() {
     local username=$1
     local use_key=$2
@@ -56,6 +56,39 @@ create_ssh_user() {
     fi
 
     echo "SSH-User ${username} wurde erfolgreich erstellt!"
+}
+
+# Funktion zum Auflisten von SSH-Usern
+list_ssh_users() {
+    echo "=== SSH User ==="
+    awk -F: '$7 ~ /\/bin\/bash/ {print $1}' /etc/passwd
+}
+
+# Funktion zum Löschen von SSH-Usern
+delete_ssh_user() {
+    local username=$1
+
+    # Prüfe ob User existiert
+    if ! id "$username" &>/dev/null; then
+        echo "Fehler: User ${username} existiert nicht!"
+        return 1
+    }
+
+    echo "ACHTUNG: Folgender User wird gelöscht: ${username}"
+    echo "Dies löscht auch das Home-Verzeichnis und alle Daten des Users!"
+    read -p "Möchtest du fortfahren? (j/N): " confirm
+    if [[ "$confirm" != "j" && "$confirm" != "J" ]]; then
+        echo "Abbruch durch Benutzer."
+        return 1
+    fi
+
+    # Alle laufenden Prozesse des Users beenden
+    pkill -u "$username"
+
+    # User und Home-Verzeichnis löschen
+    userdel -r "$username"
+
+    echo "SSH-User ${username} wurde erfolgreich gelöscht!"
 }
 
 # 1. Virtual Host erstellen
@@ -378,8 +411,9 @@ main_menu() {
         echo "9. Datenbank & User löschen"
         echo "10. Datenbanken & User anzeigen"
         echo "11. SSH-User erstellen"
-        echo "12. Beenden"
-
+        echo "12. SSH-User löschen"
+        echo "13. SSH-User anzeigen"
+        echo "14. Beenden"
         read -p "Wähle eine Option (1-12): " choice
 
         case $choice in
@@ -387,4 +421,76 @@ main_menu() {
                 read -p "Domain: " domain
                 read -p "Aliases (space-separated): " aliases
                 read -p "PHP Version (z.B. 8.2): " php_version
-                read -p "Custom DocumentRoot (
+                read -p "Custom DocumentRoot (leer lassen für /var/www/${domain}/html): " custom_docroot
+                create_vhost "$domain" "$aliases" "$php_version" "$custom_docroot"
+                ;;
+            2)
+                list_vhosts
+                read -p "Domain zum Löschen: " domain
+                delete_vhost "$domain"
+                ;;
+            3)
+                list_vhosts
+                ;;
+            4)
+                read -p "Domain: " domain
+                read -p "Neue PHP Version (z.B. 8.2): " php_version
+                change_php_version "$domain" "$php_version"
+                ;;
+            5)
+                read -p "Domain: " domain
+                setup_ssl "$domain"
+                ;;
+            6)
+                certbot certificates
+                read -p "Domain für SSL-Löschung: " domain
+                delete_ssl "$domain"
+                ;;
+            7)
+                echo "=== Installierte SSL-Zertifikate ==="
+                certbot certificates
+                ;;
+            8)
+                read -p "Datenbankname: " db_name
+                read -p "Datenbank-User: " db_user
+                read -p "Datenbank-Passwort: " db_pass
+                create_db "$db_name" "$db_user" "$db_pass"
+                ;;
+            9)
+                list_databases
+                read -p "Datenbankname zum Löschen: " db_name
+                read -p "Datenbank-User zum Löschen: " db_user
+                delete_db "$db_name" "$db_user"
+                ;;
+            10)
+                list_databases
+                ;;
+            11)
+                read -p "Username: " username
+                read -p "SSH-Key verwenden? (j/N): " use_key
+                if [[ "$use_key" == "j" || "$use_key" == "J" ]]; then
+                    read -p "SSH Public Key: " ssh_key
+                    create_ssh_user "$username" "true" "$ssh_key"
+                else
+                    read -s -p "Passwort: " password
+                    echo
+                    create_ssh_user "$username" "false" "" "$password"
+                fi
+                ;;
+            12)
+                list_ssh_users
+                read -p "Username zum Löschen: " username
+                delete_ssh_user "$username"
+                ;;
+            13)
+                list_ssh_users
+                ;;
+            14)
+                echo "Beende Programm..."
+                running=false
+                break
+                ;;
+            *)
+                echo "Ungültige Option!"
+                ;;
+        esac

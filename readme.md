@@ -13,7 +13,7 @@ A comprehensive toolkit for managing Debian-based web servers with PHP, MariaDB,
 ## Installation
 
 ```bash
-git clone [your-repo-url]
+git clone https://github.com/markus-michalski/server-tools.git
 cd server-tools
 chmod +x install.sh
 sudo ./install.sh

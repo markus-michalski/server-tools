@@ -14,27 +14,45 @@ add_docroot() {
         return 1
     fi
 
+    # Prüfe und installiere ACL wenn nötig
+    if ! check_acl; then
+        echo "Fehler: ACL-Setup fehlgeschlagen. Fahre mit Standard-Berechtigungen fort."
+        use_acl=false
+    else
+        use_acl=true
+    fi
+
+    # Normalisiere den Pfad
+    docroot=$(echo "$docroot" | sed 's#/\+#/#g' | sed 's#/$##')
+
+    echo "Erstelle/Aktualisiere DocRoot: $docroot"
+
     # Erstelle DocRoot falls nicht vorhanden
     if [ ! -d "$docroot" ]; then
-        echo "Erstelle DocRoot: $docroot"
         mkdir -p "$docroot"
     fi
 
-    # Setze Berechtigungen
-    if [ "$is_developer" = "true" ]; then
-        chown "${username}:www-data" "$docroot"
-        chmod 750 "$docroot"
-    else
-        chown "${username}:www-data" "$docroot"
-        chmod 750 "$docroot"
+    if [ "$use_acl" = true ]; then
+        echo "Setze ACL-Berechtigungen..."
+        # Setze ACL für den Benutzer und www-data
+        setfacl -R -m u:${username}:rwx,g:www-data:rwx "$docroot"
+        setfacl -R -m d:u:${username}:rwx,d:g:www-data:rwx "$docroot"
     fi
 
-    # Erstelle symbolischen Link mit eindeutigem Namen
+    # Setze Basis-Besitzer und Gruppe
+    chown www-data:www-data "$docroot"
+    chmod 2775 "$docroot"  # SGID-Bit für Gruppenvererbung
+
+    # Setze Berechtigungen rekursiv für bestehende Dateien
+    find "$docroot" -type d -exec chmod 2775 {} \;
+    find "$docroot" -type f -exec chmod 664 {} \;
+    find "$docroot" -exec chown www-data:www-data {} \;
+
+    # Erstelle symbolischen Link
     local link_name=$(basename "$docroot")
     local count=0
     local final_link_name="${link_name}"
 
-    # Prüfe auf existierende Links und füge Zähler hinzu wenn nötig
     while [ -L "/home/$username/www-${final_link_name}" ]; do
         count=$((count + 1))
         final_link_name="${link_name}-${count}"
@@ -42,145 +60,112 @@ add_docroot() {
 
     ln -s "$docroot" "/home/$username/www-${final_link_name}"
 
-    # Erstelle .htaccess mit Basis-Sicherheitseinstellungen
-    if [ ! -f "${docroot}/.htaccess" ]; then
-        cat > "${docroot}/.htaccess" << EOF
-# Basis-Sicherheitseinstellungen
-Options -Indexes
-ServerSignature Off
+    # Validierung der Berechtigungen
+    echo "Überprüfe Berechtigungen..."
+    local test_dir="${docroot}/test_folder_$$"
+    sudo -u "$username" mkdir -p "$test_dir"
 
-# PHP-Einstellungen
-php_flag display_errors off
-php_value upload_max_filesize 64M
-php_value post_max_size 64M
-php_value max_execution_time 300
-php_value max_input_time 300
-
-# Schutz vor XSS, Clickjacking etc.
-Header set X-Content-Type-Options "nosniff"
-Header set X-Frame-Options "SAMEORIGIN"
-Header set X-XSS-Protection "1; mode=block"
-EOF
-
-        chown "${username}:www-data" "${docroot}/.htaccess"
-        chmod 644 "${docroot}/.htaccess"
+    if [ $? -eq 0 ]; then
+        echo "✓ Berechtigungstest erfolgreich"
+        ls -la "$test_dir"
+        if [ "$use_acl" = true ]; then
+            echo "ACL-Berechtigungen:"
+            getfacl "$test_dir"
+        fi
+        rm -rf "$test_dir"
+    else
+        echo "! Warnung: Berechtigungstest fehlgeschlagen"
     fi
 
-    echo "DocRoot hinzugefügt: $docroot (Link: www-${final_link_name})"
+    echo "DocRoot Setup abgeschlossen:"
+    if [ "$use_acl" = true ]; then
+        echo "✓ ACL-Berechtigungen gesetzt"
+    else
+        echo "✓ Standard-Berechtigungen gesetzt"
+    fi
+    echo "✓ Symbolischer Link erstellt: www-${final_link_name}"
+
     return 0
 }
 
-# Liste alle DocRoots eines Users auf
-list_docroots() {
+# Funktion zum Reparieren bestehender Berechtigungen
+repair_docroot_permissions() {
     local username=$1
-
-    echo "DocRoots für User $username:"
-    ls -la "/home/$username/" | grep "^l.*www-" | awk '{print $9 " -> " $11}'
-}
-
-# Entferne einen DocRoot
-remove_docroot() {
-    local username=$1
-    local docroot=$2
-
-    local link_name=$(basename "$docroot")
-    # Suche alle Links die auf diesen DocRoot zeigen
-    for link in /home/$username/www-*; do
-        if [ -L "$link" ] && [ "$(readlink "$link")" = "$docroot" ]; then
-            rm "$link"
-            echo "DocRoot-Link entfernt: $(basename "$link")"
-        fi
-    done
-}
-
-# Funktion zum Auflisten aller DocRoots eines Users
-list_docroots() {
-    local username=$1
-
-    echo "DocRoots für User $username:"
-    ls -la "/home/$username/" | grep "www-" | awk '{print $9 " -> " $11}'
-}
-
-# Funktion zum Entfernen eines DocRoots
-remove_docroot() {
-    local username=$1
-    local docroot=$2
-
-    local link_name=$(basename "$docroot")
-    if [ -L "/home/$username/www-${link_name}" ]; then
-        rm "/home/$username/www-${link_name}"
-        echo "DocRoot-Link entfernt: www-${link_name}"
-    else
-        echo "DocRoot-Link nicht gefunden!"
-    fi
-}
-
-# Erweitertes DocRoot-Management
-manage_docroots() {
-    local username=$1
-    local submenu=true
-
-    while $submenu; do
-        clear
-        echo "=== DocRoot Management für $username ==="
-        echo "1. DocRoot hinzufügen"
-        echo "2. DocRoots anzeigen"
-        echo "3. DocRoot entfernen"
-        echo "4. Zurück"
-        echo
-        read -p "Wähle eine Option (1-4): " choice
-
-        case $choice in
-            1)
-                read -p "Pfad zum neuen DocRoot (oder 'q' für abbrechen): " new_docroot
-                [ "$new_docroot" = "q" ] && continue
-                if [ ! -z "$new_docroot" ]; then
-                    # Prüfe ob der User ein Entwickler ist
-                    if grep -q "/bin/bash" <(getent passwd "$username"); then
-                        add_docroot "$username" "$new_docroot" "true"
-                    else
-                        add_docroot "$username" "$new_docroot" "false"
-                    fi
-                fi
-                ;;
-            2)
-                list_docroots "$username"
-                ;;
-            3)
-                echo "Verfügbare DocRoots:"
-                list_docroots "$username"
-                echo
-                read -p "Pfad zum zu entfernenden DocRoot: " remove_path
-                if [ ! -z "$remove_path" ]; then
-                    remove_docroot "$username" "$remove_path"
-                fi
-                ;;
-            4)
-                submenu=false
-                continue
-                ;;
-            *)
-                echo "Ungültige Option!"
-                ;;
-        esac
-
-        if [ "$choice" != "4" ]; then
-            echo
-            read -p "Enter drücken zum Fortfahren..."
-        fi
-    done
-}
-
-# SSH User erstellen (angepasst für multiple DocRoots)
-create_ssh_user() {
-    local username=$1
-    local use_key=$2
-    local ssh_key=$3
-    local password=$4
-    local is_developer=$7
+    local is_developer=$2
 
     if [ -z "$username" ]; then
         echo "Fehler: Kein Username angegeben!"
+        return 1
+    fi
+
+    echo "Repariere DocRoot-Berechtigungen für User ${username}..."
+
+    # Finde alle DocRoots des Users
+    for link in /home/${username}/www-*; do
+        if [ -L "$link" ]; then
+            local docroot=$(readlink -f "$link")
+            if [ -d "$docroot" ]; then
+                echo "Verarbeite: $docroot"
+
+                echo "1/3 Setze Basis-Berechtigungen..."
+                chown www-data:www-data "$docroot"
+                chmod 775 "$docroot"
+                chmod g+s "$docroot"
+
+                echo "2/3 Verarbeite Verzeichnisse..."
+                find "$docroot" -type d -print0 | while IFS= read -r -d $'\0' dir; do
+                    echo -ne "   Verarbeite: $dir\r"
+                    chown www-data:www-data "$dir"
+                    chmod 775 "$dir"
+                done
+                echo
+
+                echo "3/3 Verarbeite Dateien..."
+                find "$docroot" -type f -print0 | while IFS= read -r -d $'\0' file; do
+                    echo -ne "   Verarbeite: $file\r"
+                    chown www-data:www-data "$file"
+                    chmod 664 "$file"
+                done
+                echo
+
+                # Spezielle Verzeichnisse für Nextcloud
+                if [ -d "${docroot}/config" ] || [ -d "${docroot}/data" ] || [ -d "${docroot}/apps" ]; then
+                    echo "Verarbeite Nextcloud-Verzeichnisse..."
+                    for dir in "config" "data" "apps" "apps-external" "assets" ".well-known"; do
+                        if [ -d "${docroot}/${dir}" ]; then
+                            echo "   Setze Berechtigungen für ${dir}"
+                            chown -R www-data:www-data "${docroot}/${dir}"
+                            chmod 775 "${docroot}/${dir}"
+                            find "${docroot}/${dir}" -type d -exec chmod 775 {} \;
+                            find "${docroot}/${dir}" -type f -exec chmod 664 {} \;
+                        fi
+                    done
+                fi
+
+                echo "DocRoot $docroot wurde verarbeitet"
+                echo "----------------------------------------"
+            fi
+        fi
+    done
+
+    echo "DocRoot-Berechtigungen wurden aktualisiert!"
+    echo "Bitte teste die Berechtigungen durch Erstellen eines neuen Ordners."
+}
+
+# SSH User erstellen
+create_ssh_user() {
+    local username=$1
+    local password=$2
+    local is_developer=$3
+    local docroot=$4  # Optional: wird beim DocRoot Setup abgefragt wenn nicht angegeben
+
+    if [ -z "$username" ]; then
+        echo "Fehler: Kein Username angegeben!"
+        return 1
+    fi
+
+    if [ -z "$password" ]; then
+        echo "Fehler: Kein Passwort angegeben!"
         return 1
     fi
 
@@ -198,12 +183,9 @@ create_ssh_user() {
         fi
     fi
 
-    # Erstelle User
-    if [ "$is_developer" = "true" ]; then
-        useradd -m -s /bin/bash "$username"
-    else
-        useradd -m -s /bin/bash "$username"
-    fi
+    # Erstelle User mit www-data als Gruppe
+    useradd -m -g www-data -s /bin/bash "$username"
+    echo "${username}:${password}" | chpasswd
 
     # Basis-Verzeichnisstruktur
     if [ "$is_developer" = "true" ]; then
@@ -299,11 +281,7 @@ EOF
     while [[ "$add_more" == "j" || "$add_more" == "J" ]]; do
         read -p "DocRoot-Pfad (oder Enter für überspringen): " docroot
         if [ ! -z "$docroot" ]; then
-            if [ "$is_developer" = "true" ]; then
-                add_docroot "$username" "$docroot" "true"
-            else
-                add_docroot "$username" "$docroot" "false"
-            fi
+            add_docroot "$username" "$docroot" "$is_developer"
         fi
         read -p "Weiteren DocRoot hinzufügen? (j/N): " add_more
     done
@@ -339,7 +317,7 @@ EOF
     fi
 
     # Setze finale Berechtigungen
-    chown -R "${username}:${username}" "/home/${username}"
+    chown -R "${username}:www-data" "/home/${username}"
     chmod 750 "/home/${username}"
     chmod 755 "/home/${username}/bin"
 
@@ -360,6 +338,14 @@ EOF
     echo "SFTP-Zugriff: sftp ${username}@domain"
     echo "Verfügbare DocRoots:"
     list_docroots "$username"
+}
+
+# Liste alle DocRoots eines Users auf
+list_docroots() {
+    local username=$1
+
+    echo "DocRoots für User $username:"
+    ls -la "/home/$username/" | grep "^l.*www-" | awk '{print $9 " -> " $11}'
 }
 
 # SSH User löschen
@@ -389,42 +375,41 @@ delete_ssh_user() {
     # Entferne SFTP/SSH-Konfiguration
     sed -i "/Match User ${username}/,+10d" /etc/ssh/sshd_config
 
-    # Backup des Home-Verzeichnisses
-    if [ -d "/home/${username}" ]; then
-        read -p "Backup des Home-Verzeichnisses erstellen? (j/N): " backup
-        if [[ "$backup" == "j" || "$backup" == "J" ]]; then
-            backup_dir="/root/user_backups"
-            mkdir -p "$backup_dir"
-            timestamp=$(date +%Y%m%d_%H%M%S)
-            tar czf "${backup_dir}/${username}_backup_${timestamp}.tar.gz" "/home/${username}" 2>/dev/null
-            echo "Backup erstellt unter: ${backup_dir}/${username}_backup_${timestamp}.tar.gz"
-        fi
-    fi
+   # Backup des Home-Verzeichnisses
+       if [ -d "/home/${username}" ]; then
+           read -p "Backup des Home-Verzeichnisses erstellen? (j/N): " backup
+           if [[ "$backup" == "j" || "$backup" == "J" ]]; then
+               backup_dir="/root/user_backups"
+               mkdir -p "$backup_dir"
+               timestamp=$(date +%Y%m%d_%H%M%S)
+                           tar czf "${backup_dir}/${username}_backup_${timestamp}.tar.gz" "/home/${username}" 2>/dev/null
+                           echo "Backup erstellt unter: ${backup_dir}/${username}_backup_${timestamp}.tar.gz"
+                       fi
+                   fi
 
-    # Entferne PHP-FPM Pool falls vorhanden
-    if [ -f "/etc/php/8.2/fpm/pool.d/${username}.conf" ]; then
-        rm "/etc/php/8.2/fpm/pool.d/${username}.conf"
-        systemctl restart php8.2-fpm
-    fi
+                   # Entferne PHP-FPM Pool falls vorhanden
+                   if [ -f "/etc/php/8.2/fpm/pool.d/${username}.conf" ]; then
+                       rm "/etc/php/8.2/fpm/pool.d/${username}.conf"
+                       systemctl restart php8.2-fpm
+                   fi
 
-    # Entferne Logrotation falls vorhanden
-    if [ -f "/etc/logrotate.d/${username}" ]; then
-        rm "/etc/logrotate.d/${username}"
-    fi
+                   # Entferne Logrotation falls vorhanden
+                   if [ -f "/etc/logrotate.d/${username}" ]; then
+                       rm "/etc/logrotate.d/${username}"
+                   fi
 
-    # Lösche User und Home-Verzeichnis
-    userdel -r "$username" 2>/dev/null || {
-        echo "Standard-Löschung fehlgeschlagen, versuche forcierte Löschung..."
-        userdel "$username" 2>/dev/null
-        rm -rf "/home/${username}" 2>/dev/null
-    }
+                   # Lösche User und Home-Verzeichnis
+                   userdel -r "$username" 2>/dev/null || {
+                       echo "Standard-Löschung fehlgeschlagen, versuche forcierte Löschung..."
+                       userdel "$username" 2>/dev/null
+                       rm -rf "/home/${username}" 2>/dev/null
+                   }
 
-    # Neustart SSH Service
-    systemctl restart sshd
+                   # Neustart SSH Service
+                   systemctl restart sshd
 
-    echo "User ${username} wurde gelöscht!"
-}
-
+                   echo "User ${username} wurde gelöscht!"
+               }
 # SSH Key für User generieren
 generate_ssh_key() {
     local username=$1
@@ -453,7 +438,7 @@ generate_ssh_key() {
     chmod 700 "$ssh_dir"
     chmod 600 "${ssh_dir}/id_${key_type}"
     chmod 644 "${ssh_dir}/id_${key_type}.pub"
-    chown -R "${username}:${username}" "$ssh_dir"
+    chown -R "${username}:www-data" "$ssh_dir"
 
     echo "SSH-Key wurde generiert!"
     echo "Öffentlicher Schlüssel:"
@@ -494,7 +479,7 @@ add_ssh_key() {
 
     chmod 700 "$ssh_dir"
     chmod 600 "$auth_keys"
-    chown -R "${username}:${username}" "$ssh_dir"
+    chown -R "${username}:www-data" "$ssh_dir"
 
     echo "SSH-Key wurde hinzugefügt!"
 }
@@ -530,28 +515,6 @@ list_ssh_users() {
     awk -F: '$7 ~ /\/bin\/bash/ || $7 ~ /\/bin\/rbash/ {print "- " $1}' /etc/passwd
 }
 
-# Repariere Chroot-Umgebung
-repair_chroot() {
-    local username=$1
-
-    if [ -z "$username" ]; then
-        echo "Fehler: Kein Username angegeben!"
-        return 1
-    fi
-
-    if ! id "$username" &>/dev/null; then
-        echo "Fehler: User ${username} existiert nicht!"
-        return 1
-    fi
-
-    local home_dir=$(getent passwd "$username" | cut -d: -f6)
-    local parent_dir=$(dirname "$home_dir")
-
-    echo "Repariere Chroot-Umgebung für User ${username}..."
-    setup_chroot_env "$parent_dir" "$username"
-    echo "Chroot-Umgebung wurde repariert!"
-}
-
 # SSH User zu Entwickler upgraden
 upgrade_to_dev() {
     local username=$1
@@ -584,12 +547,91 @@ upgrade_to_dev() {
     sleep 2
 
     if [ ! -z "$temp_key" ]; then
-        create_ssh_user "$username" "true" "$temp_key" "" "$docroot" "false" "true"
+        create_ssh_user "$username" "$password" "true"  # Als Entwickler
     else
         read -s -p "Neues Passwort für Entwickler-Account: " password
         echo
-        create_ssh_user "$username" "false" "" "$password" "$docroot" "false" "true"
+        create_ssh_user "$username" "$password" "true"  # Als Entwickler
     fi
+}
+
+# Entferne einen DocRoot
+remove_docroot() {
+    local username=$1
+    local docroot=$2
+
+    local link_name=$(basename "$docroot")
+    # Suche alle Links die auf diesen DocRoot zeigen
+    for link in /home/$username/www-*; do
+        if [ -L "$link" ] && [ "$(readlink "$link")" = "$docroot" ]; then
+            rm "$link"
+            echo "DocRoot-Link entfernt: $(basename "$link")"
+        fi
+    done
+}
+
+# Erweitertes DocRoot-Management
+manage_docroots() {
+    local username=$1
+    local submenu=true
+
+    while $submenu; do
+        clear
+        echo "=== DocRoot Management für $username ==="
+        echo "1. DocRoot hinzufügen"
+        echo "2. DocRoots anzeigen"
+        echo "3. DocRoot entfernen"
+        echo "4. DocRoot-Berechtigungen reparieren"
+        echo "5. Zurück"
+        echo
+        read -p "Wähle eine Option (1-5): " choice
+
+        case $choice in
+            1)
+                read -p "Pfad zum neuen DocRoot (oder 'q' für abbrechen): " new_docroot
+                [ "$new_docroot" = "q" ] && continue
+                if [ ! -z "$new_docroot" ]; then
+                    if grep -q "/bin/bash" <(getent passwd "$username"); then
+                        add_docroot "$username" "$new_docroot" "true"
+                    else
+                        add_docroot "$username" "$new_docroot" "false"
+                    fi
+                fi
+                ;;
+            2)
+                list_docroots "$username"
+                ;;
+            3)
+                echo "Verfügbare DocRoots:"
+                list_docroots "$username"
+                echo
+                read -p "Pfad zum zu entfernenden DocRoot: " remove_path
+                if [ ! -z "$remove_path" ]; then
+                    remove_docroot "$username" "$remove_path"
+                fi
+                ;;
+            4)
+                if grep -q "/bin/bash" <(getent passwd "$username"); then
+                    repair_docroot_permissions "$username" "true"
+                else
+                    repair_docroot_permissions "$username" "false"
+                fi
+                echo "Berechtigungen wurden repariert!"
+                ;;
+            5)
+                submenu=false
+                continue
+                ;;
+            *)
+                echo "Ungültige Option!"
+                ;;
+        esac
+
+        if [ "$choice" != "5" ]; then
+            echo
+            read -p "Enter drücken zum Fortfahren..."
+        fi
+    done
 }
 
 # SSH User Management Menü
@@ -608,58 +650,27 @@ ssh_menu() {
         echo "7. SSH-Keys eines Users anzeigen"
         echo "8. User zu Entwickler-Account upgraden"
         echo "9. DocRoots verwalten"
-        echo "10. Zurück zum Hauptmenü"
+        echo "10. DocRoot-Berechtigungen reparieren"
+        echo "11. Zurück zum Hauptmenü"
         echo
-        read -p "Wähle eine Option (1-10): " choice
+        read -p "Wähle eine Option (1-11): " choice
 
         case $choice in
             1)
                 echo
                 read -p "Username (oder 'q' für abbrechen): " username
                 [ "$username" = "q" ] && continue
-
-                read -p "SSH-Key verwenden? (j/N): " use_key
-
-                if [[ "$use_key" == "j" || "$use_key" == "J" ]]; then
-                    read -p "SSH-Key generieren? (j/N): " generate_key
-                    if [[ "$generate_key" == "j" || "$generate_key" == "J" ]]; then
-                        create_ssh_user "$username" "true" "" "" "" "true" "false"
-                    else
-                        echo "Bitte SSH Public Key eingeben (Format: ssh-rsa/ssh-ed25519 AAAA... user@host):"
-                        read ssh_key
-                        if ! validate_ssh_key "$ssh_key"; then
-                            echo "Fehler: Ungültiges SSH-Key Format!"
-                            read -p "Enter drücken zum Fortfahren..."
-                            continue
-                        fi
-                        create_ssh_user "$username" "true" "$ssh_key" "" "" "false" "false"
-                    fi
-                else
-                    read -s -p "Passwort: " password
-                    echo
-                    create_ssh_user "$username" "false" "" "$password" "" "false" "false"
-                fi
+                read -s -p "Passwort: " password
+                echo
+                create_ssh_user "$username" "$password" "false"  # Standard-User
                 ;;
             2)
                 echo
                 read -p "Username (oder 'q' für abbrechen): " username
                 [ "$username" = "q" ] && continue
-
-                read -p "SSH-Key verwenden? (j/N): " use_key
-                if [[ "$use_key" == "j" || "$use_key" == "J" ]]; then
-                    read -p "SSH-Key generieren? (j/N): " generate_key
-                    if [[ "$generate_key" == "j" || "$generate_key" == "J" ]]; then
-                        create_ssh_user "$username" "true" "" "" "" "true" "true"
-                    else
-                        echo "Bitte SSH Public Key eingeben (Format: ssh-rsa/ssh-ed25519 AAAA... user@host):"
-                        read ssh_key
-                        create_ssh_user "$username" "true" "$ssh_key" "" "" "false" "true"
-                    fi
-                else
-                    read -s -p "Passwort: " password
-                    echo
-                    create_ssh_user "$username" "false" "" "$password" "" "false" "true"
-                fi
+                read -s -p "Passwort: " password
+                echo
+                create_ssh_user "$username" "$password" "true"   # Entwickler-Account
                 ;;
             3)
                 echo
@@ -723,6 +734,24 @@ ssh_menu() {
                 fi
                 ;;
             10)
+                echo
+                list_ssh_users
+                echo
+                read -p "Username für Berechtigungsreparatur (oder 'q' für abbrechen): " username
+                [ "$username" = "q" ] && continue
+                if id "$username" &>/dev/null; then
+                    if grep -q "/bin/bash" <(getent passwd "$username"); then
+                        repair_docroot_permissions "$username" "true"
+                    else
+                        repair_docroot_permissions "$username" "false"
+                    fi
+                    echo "Berechtigungen wurden repariert!"
+                else
+                    echo "User existiert nicht!"
+                fi
+                read -p "Enter drücken zum Fortfahren..."
+                ;;
+            11)
                 submenu=false
                 continue
                 ;;
@@ -731,7 +760,7 @@ ssh_menu() {
                 ;;
         esac
 
-        if [ "$choice" != "10" ]; then
+        if [ "$choice" != "11" ]; then
             echo
             read -p "Enter drücken zum Fortfahren..."
             clear

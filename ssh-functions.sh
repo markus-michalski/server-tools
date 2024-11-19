@@ -7,7 +7,6 @@ add_docroot() {
     local username=$1
     local docroot=$2
     local is_developer=$3
-    local domain=$4
 
     if [ -z "$username" ] || [ -z "$docroot" ]; then
         echo "Fehler: Username und DocRoot müssen angegeben werden!"
@@ -16,10 +15,8 @@ add_docroot() {
 
     # Prüfe und installiere ACL wenn nötig
     if ! check_acl; then
-        echo "Fehler: ACL-Setup fehlgeschlagen. Fahre mit Standard-Berechtigungen fort."
-        use_acl=false
-    else
-        use_acl=true
+        echo "FEHLER: ACL-Setup fehlgeschlagen."
+        return 1
     fi
 
     # Normalisiere den Pfad
@@ -32,21 +29,16 @@ add_docroot() {
         mkdir -p "$docroot"
     fi
 
-    if [ "$use_acl" = true ]; then
-        echo "Setze ACL-Berechtigungen..."
-        # Setze ACL für den Benutzer und www-data
-        setfacl -R -m u:${username}:rwx,g:www-data:rwx "$docroot"
-        setfacl -R -m d:u:${username}:rwx,d:g:www-data:rwx "$docroot"
-    fi
+    echo "Setze ACL-Berechtigungen..."
 
-    # Setze Basis-Besitzer und Gruppe
-    chown www-data:www-data "$docroot"
-    chmod 2775 "$docroot"  # SGID-Bit für Gruppenvererbung
+    # Setze Basis-Besitzer
+    chown "${username}:www-data" "$docroot"
+    chmod 775 "$docroot"
 
-    # Setze Berechtigungen rekursiv für bestehende Dateien
-    find "$docroot" -type d -exec chmod 2775 {} \;
-    find "$docroot" -type f -exec chmod 664 {} \;
-    find "$docroot" -exec chown www-data:www-data {} \;
+    # Setze ACL für bestehende Dateien
+    setfacl -R -m u:${username}:rwx,g:www-data:rwx "$docroot"
+    # Setze Default-ACL für neue Dateien
+    setfacl -R -d -m u:${username}:rwx,g:www-data:rwx "$docroot"
 
     # Erstelle symbolischen Link
     local link_name=$(basename "$docroot")
@@ -68,24 +60,53 @@ add_docroot() {
     if [ $? -eq 0 ]; then
         echo "✓ Berechtigungstest erfolgreich"
         ls -la "$test_dir"
-        if [ "$use_acl" = true ]; then
-            echo "ACL-Berechtigungen:"
-            getfacl "$test_dir"
-        fi
+        echo "ACL-Berechtigungen:"
+        getfacl "$test_dir"
         rm -rf "$test_dir"
     else
         echo "! Warnung: Berechtigungstest fehlgeschlagen"
     fi
 
     echo "DocRoot Setup abgeschlossen:"
-    if [ "$use_acl" = true ]; then
-        echo "✓ ACL-Berechtigungen gesetzt"
-    else
-        echo "✓ Standard-Berechtigungen gesetzt"
-    fi
+    echo "✓ ACL-Berechtigungen gesetzt"
+    echo "✓ Default-ACL für neue Dateien konfiguriert"
     echo "✓ Symbolischer Link erstellt: www-${final_link_name}"
 
+    # Zeige finale ACL-Berechtigungen
+    echo -e "\nAktuelle ACL-Berechtigungen:"
+    getfacl "$docroot"
+
     return 0
+}
+
+repair_acl_permissions() {
+    local docroot=$1
+    local username=$2
+
+    if [ -z "$docroot" ] || [ -z "$username" ]; then
+        echo "Fehler: DocRoot und Username müssen angegeben werden!"
+        return 1
+    fi
+
+    if [ ! -d "$docroot" ]; then
+        echo "Fehler: DocRoot existiert nicht!"
+        return 1
+    fi
+
+    if ! check_acl; then
+        echo "FEHLER: ACL-Setup fehlgeschlagen."
+        return 1
+    fi
+
+    echo "Repariere ACL-Berechtigungen für $docroot..."
+
+    # Setze ACL für bestehende Dateien
+    setfacl -R -m u:${username}:rwx,g:www-data:rwx "$docroot"
+    # Setze Default-ACL für neue Dateien
+    setfacl -R -d -m u:${username}:rwx,g:www-data:rwx "$docroot"
+
+    echo "ACL-Berechtigungen repariert!"
+    getfacl "$docroot"
 }
 
 # Funktion zum Reparieren bestehender Berechtigungen
@@ -560,14 +581,28 @@ remove_docroot() {
     local username=$1
     local docroot=$2
 
+    if [ -z "$username" ] || [ -z "$docroot" ]; then
+        echo "Fehler: Username und DocRoot müssen angegeben werden!"
+        return 1
+    fi
+
     local link_name=$(basename "$docroot")
-    # Suche alle Links die auf diesen DocRoot zeigen
+
+    # Entferne ACL-Einträge
+    if setfacl --remove-all -R "$docroot" 2>/dev/null; then
+        echo "ACL-Einträge wurden entfernt"
+    fi
+
+    # Suche und entferne alle Links die auf diesen DocRoot zeigen
     for link in /home/$username/www-*; do
         if [ -L "$link" ] && [ "$(readlink "$link")" = "$docroot" ]; then
             rm "$link"
             echo "DocRoot-Link entfernt: $(basename "$link")"
         fi
     done
+
+    echo "DocRoot wurde erfolgreich entfernt"
+    return 0
 }
 
 # Erweitertes DocRoot-Management
@@ -651,13 +686,14 @@ ssh_menu() {
         echo "8. User zu Entwickler-Account upgraden"
         echo "9. DocRoots verwalten"
         echo "10. DocRoot-Berechtigungen reparieren"
-        echo "11. Zurück zum Hauptmenü"
+        echo "11. ACL-Berechtigungen reparieren"
+        echo "12. Zurück zum Hauptmenü"
         echo
-        read -p "Wähle eine Option (1-11): " choice
+        read -r -p "Wähle eine Option (1-12): " choice
 
         case $choice in
             1)
-                echo
+              echo
                 read -p "Username (oder 'q' für abbrechen): " username
                 [ "$username" = "q" ] && continue
                 read -s -p "Passwort: " password
@@ -752,6 +788,20 @@ ssh_menu() {
                 read -p "Enter drücken zum Fortfahren..."
                 ;;
             11)
+                echo
+                list_ssh_users
+                echo
+                read -p "Username für ACL-Reparatur (oder 'q' für abbrechen): " username
+                [ "$username" = "q" ] && continue
+                if id "$username" &>/dev/null; then
+                    read -p "DocRoot-Pfad: " docroot
+                    repair_acl_permissions "$docroot" "$username"
+                else
+                    echo "User existiert nicht!"
+                fi
+                read -p "Enter drücken zum Fortfahren..."
+                ;;
+            12)
                 submenu=false
                 continue
                 ;;
@@ -760,7 +810,7 @@ ssh_menu() {
                 ;;
         esac
 
-        if [ "$choice" != "11" ]; then
+        if [ "$choice" != "12" ]; then
             echo
             read -p "Enter drücken zum Fortfahren..."
             clear

@@ -40,6 +40,58 @@ servertools
 3. Database Management
 4. SSH User Management
 
+## Workflow Best Practices
+
+### Correct Setup Order
+
+1. First, create SSH user:
+   ```bash
+   servertools
+   # Select SSH User Management
+   # Create standard or developer SSH user
+   # Set DocRoot to base directory (e.g., /var/www/domain)
+   ```
+
+2. Then, create Virtual Host:
+   ```bash
+   servertools
+   # Select Virtual Host Management
+   # Create new vHost
+   # Use same DocRoot as SSH user
+   # Script will automatically:
+   # - Create /html subdirectory
+   # - Set Apache DocumentRoot to /html
+   # - Set correct permissions (775/664)
+   ```
+
+Example for Nextcloud setup:
+```bash
+# 1. Create SSH user
+servertools
+# SSH User Management
+# Create user 'nextcloud-user' with DocRoot '/var/www/nextcloud'
+
+# 2. Create vHost
+servertools
+# Virtual Host Management
+# Create vHost with:
+# - Domain: cloud.example.com
+# - SSH User: nextcloud-user
+# - DocRoot: /var/www/nextcloud
+```
+
+This ensures:
+- SSH user can manage entire `/var/www/nextcloud` directory
+- Apache serves from `/var/www/nextcloud/html`
+- Correct permissions throughout the directory structure
+
+### Main Menu Options
+
+1. Virtual Host Management
+2. SSL Management
+3. Database Management
+4. SSH User Management
+
 ## Component Overview
 
 ### Virtual Host Management (`vhost-functions.sh`)
@@ -85,26 +137,50 @@ Security:
 - Automatic permission management
 - Backup before deletions
 
+# Server Management Tools
+
 ### SSH User Management (`ssh-functions.sh`)
 
 Features:
 - Create standard/developer users
 - SSH key management
-- DocRoot setup
+- DocRoot setup with ACL permissions
 - PHP-FPM pools for developers
 - Security hardening
 
+Permission Management:
+- ACL-based permission system
+- Automatic ACL setup for new DocRoots
+- ACL repair functionality
+- Secure file/directory ownership
+
 User Types:
 1. Standard Users:
-    - Limited shell access
-    - SFTP support
-    - Basic commands
+   - Limited shell access
+   - SFTP support
+   - Basic commands
+   - ACL permissions for DocRoots
 
 2. Developer Users:
-    - Full shell access
-    - Development tools
-    - Custom PHP-FPM pool
-    - Git/Composer support
+   - Full shell access
+   - Development tools
+   - Custom PHP-FPM pool
+   - Git/Composer support
+   - Enhanced ACL permissions
+
+## Best Practices
+
+1. Always use through `servertools` command
+2. Create SSH users before virtual hosts
+3. Use ACL repair function if needed:
+   ```bash
+   servertools
+   # Select SSH User Management
+   # Select "ACL-Berechtigungen reparieren"
+   # Follow prompts
+   ```
+4. Keep regular backups
+5. Monitor logs
 
 ### Common Functions (`common-functions.sh`)
 

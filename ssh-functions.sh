@@ -2,6 +2,61 @@
 
 source /root/server-tools/common-functions.sh
 
+# Funktion zum Prüfen und Einrichten von ACL
+check_and_setup_acl() {
+    echo "Prüfe ACL-Unterstützung..."
+
+    # Prüfe ob acl Paket installiert ist
+    if ! dpkg -l | grep -q "^ii.*acl "; then
+        echo "ACL Paket nicht installiert. Installiere..."
+        apt-get update && apt-get install -y acl
+        if [ $? -ne 0 ]; then
+            echo "Fehler bei der Installation von ACL!"
+            return 1
+        fi
+    fi
+
+    # Prüfe ob Root-Partition ACL unterstützt
+    root_fs=$(df -h / | tail -n 1 | awk '{print $1}')
+    if ! grep -q "${root_fs}.*acl" /etc/fstab; then
+        echo "ACL nicht in fstab für Root-Partition konfiguriert."
+        echo "Füge ACL-Option hinzu..."
+
+        # Sichere fstab
+        cp /etc/fstab /etc/fstab.backup
+
+        # Füge acl Option hinzu
+        sed -i "s|\(${root_fs}.*defaults\)|\1,acl|" /etc/fstab
+
+        # Lade systemd neu für fstab-Änderungen
+        echo "Lade systemd neu..."
+        systemctl daemon-reload
+
+        echo "Binde Root-Partition neu ein..."
+        mount -o remount,acl /
+
+        if [ $? -ne 0 ]; then
+            echo "Fehler beim Aktivieren von ACL!"
+            cp /etc/fstab.backup /etc/fstab
+            systemctl daemon-reload  # Lade auch beim Fehlerfall neu
+            return 1
+        fi
+    fi
+
+    # Teste ACL-Funktionalität
+    test_dir="/tmp/acl_test_$$"
+    mkdir -p "$test_dir"
+    if ! setfacl -m u:www-data:rwx "$test_dir" 2>/dev/null; then
+        echo "ACL-Test fehlgeschlagen!"
+        rm -rf "$test_dir"
+        return 1
+    fi
+    rm -rf "$test_dir"
+
+    echo "ACL-Setup erfolgreich!"
+    return 0
+}
+
 # DocRoot Funktionen
 add_docroot() {
     local username=$1
@@ -15,7 +70,7 @@ add_docroot() {
     fi
 
     # Prüfe und installiere ACL wenn nötig
-    if ! check_acl; then
+    if ! check_and_setup_acl; then    # <-- Hier die Änderung von check_acl zu check_and_setup_acl
         echo "Fehler: ACL-Setup fehlgeschlagen. Fahre mit Standard-Berechtigungen fort."
         use_acl=false
     else
@@ -157,7 +212,7 @@ create_ssh_user() {
     local username=$1
     local password=$2
     local is_developer=$3
-    local docroot=$4  # Optional: wird beim DocRoot Setup abgefragt wenn nicht angegeben
+    local docroot=$4
 
     if [ -z "$username" ]; then
         echo "Fehler: Kein Username angegeben!"
@@ -167,6 +222,16 @@ create_ssh_user() {
     if [ -z "$password" ]; then
         echo "Fehler: Kein Passwort angegeben!"
         return 1
+    fi
+
+    # ACL-Check VOR der User-Erstellung
+    echo "Prüfe ACL-Unterstützung für neue User-Erstellung..."
+    if ! check_and_setup_acl; then
+        echo "WARNUNG: ACL-Setup nicht möglich. Fahre mit Standard-Berechtigungen fort."
+        local use_acl=false
+    else
+        local use_acl=true
+        echo "ACL-Unterstützung verfügbar und aktiviert."
     fi
 
     # Prüfe ob User bereits existiert

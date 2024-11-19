@@ -13,6 +13,15 @@ fi
 echo "Erstelle Installationsverzeichnis ${INSTALL_DIR}..."
 mkdir -p "${INSTALL_DIR}"
 
+# Bearbeite Zeilenenden
+echo "Bearbeite Zeilenenden der Dateien (LF)"
+dos2unix common-functions.sh
+dos2unix vhost-functions.sh
+dos2unix ssl-functions.sh
+dos2unix db-functions.sh
+dos2unix ssh-functions.sh
+dos2unix server-tools.sh
+
 # Kopiere Skripte
 echo "Kopiere Skript-Dateien..."
 cp common-functions.sh "${INSTALL_DIR}/"

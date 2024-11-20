@@ -94,16 +94,21 @@ This ensures:
 
 ## Component Overview
 
-### Virtual Host Management (`vhost-functions.sh`)
+#### Virtual Host Management (`vhost-functions.sh`)
 
 Features:
+
 - Create/delete virtual hosts
 - Configure PHP versions
-- Manage DocumentRoots
+- Manage DocumentRoots (with safeguards against recursive file copying)
 - Handle domain aliases
 - SSL integration
 
+Important Note:
+When changing DocumentRoot to a subdirectory of the existing DocumentRoot, file copying will be automatically skipped to prevent recursive copying issues.
+
 Example:
+
 ```bash
 # Through main menu:
 servertools

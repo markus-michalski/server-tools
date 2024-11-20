@@ -200,7 +200,7 @@ change_php_version() {
 change_docroot() {
     local domain=$1
     local new_docroot=$2
-    local ssh_user=$3  # Optional: SSH User für neue Berechtigungen
+    local ssh_user=$3
     local old_docroot
     local ssl_conf="${domain}-le-ssl.conf"
 
@@ -210,23 +210,32 @@ change_docroot() {
     fi
 
     old_docroot=$(grep -i "DocumentRoot" "/etc/apache2/sites-available/${domain}.conf" | head -n1 | awk '{print $2}')
+    old_docroot=$(realpath -m "$old_docroot")
+    new_docroot=$(realpath -m "$new_docroot")
 
-    # Prüfe ob neuer DocumentRoot existiert
-    if [ ! -d "${new_docroot}" ]; then
-        read -p "Der DocumentRoot ${new_docroot} existiert nicht. Soll er erstellt werden? (j/N): " create_dir
-        if [[ "$create_dir" == "j" || "$create_dir" == "J" ]]; then
-            mkdir -p "${new_docroot}"
-        else
-            echo "Abbruch: Neuer DocumentRoot wurde nicht erstellt."
-            return 1
+    # Prüfe ob der neue Pfad ein Unterordner des alten ist
+    if [[ "$new_docroot" == "$old_docroot"/* ]]; then
+        echo "WARNUNG: Der neue DocRoot ist ein Unterverzeichnis des alten DocRoot."
+        echo "Das Kopieren der Dateien wird übersprungen, um Rekursion zu vermeiden."
+    else
+        # Prüfe ob neuer DocumentRoot existiert
+        if [ ! -d "${new_docroot}" ]; then
+            read -p "Der DocumentRoot ${new_docroot} existiert nicht. Soll er erstellt werden? (j/N): " create_dir
+            if [[ "$create_dir" == "j" || "$create_dir" == "J" ]]; then
+                mkdir -p "${new_docroot}"
+            else
+                echo "Abbruch: Neuer DocumentRoot wurde nicht erstellt."
+                return 1
+            fi
         fi
-    fi
 
-    # Dateien vom alten in den neuen DocumentRoot kopieren
-    if [ -d "$old_docroot" ] && [ "$(ls -A $old_docroot)" ]; then
-        read -p "Sollen die Dateien vom alten DocumentRoot kopiert werden? (j/N): " copy_files
-        if [[ "$copy_files" == "j" || "$copy_files" == "J" ]]; then
-            cp -r "${old_docroot}/." "${new_docroot}/"
+        # Frage nach Kopieren nur wenn es sich nicht um ein Unterverzeichnis handelt
+        if [ -d "$old_docroot" ] && [ "$(ls -A $old_docroot)" ]; then
+            read -p "Sollen die Dateien vom alten DocumentRoot kopiert werden? (j/N): " copy_files
+            if [[ "$copy_files" == "j" || "$copy_files" == "J" ]]; then
+                cp -r "${old_docroot}/." "${new_docroot}/"
+                echo "Dateien wurden kopiert."
+            fi
         fi
     fi
 
@@ -239,13 +248,12 @@ change_docroot() {
     find "${new_docroot}" -type d -exec chmod 775 {} \;
     find "${new_docroot}" -type f -exec chmod 664 {} \;
 
-    # HTTP vHost Konfiguration aktualisieren
+    # Apache Konfigurationen aktualisieren
     sed -i "s|DocumentRoot ${old_docroot}|DocumentRoot ${new_docroot}|g" \
         "/etc/apache2/sites-available/${domain}.conf"
     sed -i "s|<Directory ${old_docroot}|<Directory ${new_docroot}|g" \
         "/etc/apache2/sites-available/${domain}.conf"
 
-    # HTTPS/SSL vHost Konfiguration aktualisieren wenn vorhanden
     if [ -f "/etc/apache2/sites-available/${ssl_conf}" ]; then
         sed -i "s|DocumentRoot ${old_docroot}|DocumentRoot ${new_docroot}|g" \
             "/etc/apache2/sites-available/${ssl_conf}"

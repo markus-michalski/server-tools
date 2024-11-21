@@ -8,6 +8,7 @@ A comprehensive toolkit for managing Debian-based web servers with PHP, MariaDB,
 - SSL Certificate Management (Let's Encrypt)
 - Database Administration (MariaDB)
 - SSH/SFTP User Management
+- Cron Job Management
 - Security Hardening
 
 ## Installation
@@ -39,6 +40,7 @@ servertools
 2. SSL Management
 3. Database Management
 4. SSH User Management
+5. Cron Management
 
 ## Workflow Best Practices
 
@@ -85,19 +87,11 @@ This ensures:
 - Apache serves from `/var/www/nextcloud/html`
 - Correct permissions throughout the directory structure
 
-### Main Menu Options
-
-1. Virtual Host Management
-2. SSL Management
-3. Database Management
-4. SSH User Management
-
 ## Component Overview
 
-#### Virtual Host Management (`vhost-functions.sh`)
+### Virtual Host Management (`vhost-functions.sh`)
 
 Features:
-
 - Create/delete virtual hosts
 - Configure PHP versions
 - Manage DocumentRoots (with safeguards against recursive file copying)
@@ -106,15 +100,6 @@ Features:
 
 Important Note:
 When changing DocumentRoot to a subdirectory of the existing DocumentRoot, file copying will be automatically skipped to prevent recursive copying issues.
-
-Example:
-
-```bash
-# Through main menu:
-servertools
-# Select option 1
-# Follow interactive prompts
-```
 
 ### SSL Management (`ssl-functions.sh`)
 
@@ -141,8 +126,6 @@ Security:
 - Credentials stored in `/root/db-credentials/`
 - Automatic permission management
 - Backup before deletions
-
-# Server Management Tools
 
 ### SSH User Management (`ssh-functions.sh`)
 
@@ -173,19 +156,33 @@ User Types:
    - Git/Composer support
    - Enhanced ACL permissions
 
-## Best Practices
+### Cron Management (`cron-functions.sh`)
 
-1. Always use through `servertools` command
-2. Create SSH users before virtual hosts
-3. Use ACL repair function if needed:
-   ```bash
-   servertools
-   # Select SSH User Management
-   # Select "ACL-Berechtigungen reparieren"
-   # Follow prompts
-   ```
-4. Keep regular backups
-5. Monitor logs
+Features:
+- List all cron jobs (system-wide and user-specific)
+- Add new cron jobs with schedule validation
+- Remove existing cron jobs
+- Support for both system-wide (/etc/cron.d) and user-specific crontabs
+- Interactive menu-driven interface
+
+Example Usage:
+```bash
+# Through main menu:
+servertools
+# Select option 5 (Cron Management)
+# Choose from available options:
+# 1. List cron jobs
+# 2. Add new cron job
+# 3. Remove cron job
+```
+
+Schedule Format:
+- Standard cron format (minute hour day month weekday)
+- Automatic validation of schedule syntax
+- Examples:
+   - `0 4 * * *` (Daily at 4 AM)
+   - `*/15 * * * *` (Every 15 minutes)
+   - `0 0 * * 0` (Weekly on Sunday at midnight)
 
 ### Common Functions (`common-functions.sh`)
 
@@ -213,6 +210,7 @@ Shared utilities:
 ├── vhost-functions.sh
 ├── ssl-functions.sh
 ├── ssh-functions.sh
+├── cron-functions.sh
 └── server-tools.sh
 ```
 
@@ -277,7 +275,8 @@ Guidelines for contributing:
 5. Follow security best practices
 
 ## License
-# MIT License
+
+MIT License
 
 Copyright (c) 2024 [Markus Michalski]
 

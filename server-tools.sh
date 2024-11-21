@@ -7,6 +7,7 @@ source "${SCRIPT_DIR}/vhost-functions.sh"
 source "${SCRIPT_DIR}/ssl-functions.sh"
 source "${SCRIPT_DIR}/db-functions.sh"
 source "${SCRIPT_DIR}/ssh-functions.sh"
+source "${SCRIPT_DIR}/cron-functions.sh"
 
 # Hauptmenü
 main_menu() {
@@ -19,9 +20,10 @@ main_menu() {
         echo "2. SSL Management"
         echo "3. Datenbank Management"
         echo "4. SSH User Management"
-        echo "5. Beenden"
+        echo "5. Cron Management"
+        echo "6. Beenden"
 
-        read -p "Wähle eine Option (1-5): " choice
+        read -p "Wähle eine Option (1-6): " choice
 
         case $choice in
             1)
@@ -37,6 +39,9 @@ main_menu() {
                 ssh_menu
                 ;;
             5)
+                cron_menu
+                ;;
+            6)
                 echo "Beende Programm..."
                 running=false
                 break

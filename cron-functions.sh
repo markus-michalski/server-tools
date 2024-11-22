@@ -20,10 +20,11 @@ list_user_crons() {
 
 # Fügt einen neuen Cronjob hinzu
 add_cron() {
-    local user=$1
-    local schedule=$2
-    local command=$3
-    local cron_type=$4  # "user" oder "system"
+    local user="$1"
+    local schedule="$2"
+    local command="$3"
+    local cron_type="$4"
+    local name="$5"
 
     # Validiere Schedule-Format
     if ! validate_cron_schedule "$schedule"; then
@@ -32,8 +33,8 @@ add_cron() {
     fi
 
     if [ "$cron_type" = "system" ]; then
-        # Systemweiter Cronjob in /etc/cron.d
-        local cron_file="/etc/cron.d/custom_$(date +%s)"
+        # Systemweiter Cronjob in /etc/cron.d mit benutzerdefiniertem Namen
+        local cron_file="/etc/cron.d/${name:-custom_$(date +%s)}"
         echo "$schedule root $command" > "$cron_file"
         chmod 644 "$cron_file"
     else
@@ -44,17 +45,22 @@ add_cron() {
 
 # Validiert das Cron-Schedule-Format
 validate_cron_schedule() {
-    local schedule=$1
-    local parts=($schedule)
-    
-    # Prüfe ob 5 Teile vorhanden sind (Minute Stunde Tag Monat Wochentag)
+    # Schedule in ein Array aufteilen und Leerzeichen als Trennzeichen verwenden
+    IFS=' ' read -r -a parts <<< "$1"
+
+    # Debug-Ausgabe
+    echo "Schedule: $1"
+    echo "Teile: ${parts[*]}"
+    echo "Anzahl Teile: ${#parts[@]}"
+
     if [ ${#parts[@]} -ne 5 ]; then
+        echo "Fehler: Benötige 5 Teile, gefunden: ${#parts[@]}"
         return 1
     fi
-    
-    # Validiere jeden Teil
+
     for part in "${parts[@]}"; do
         if ! [[ "$part" =~ ^[0-9*,/-]+$ ]]; then
+            echo "Fehler: Ungültiges Format in Teil: $part"
             return 1
         fi
     done
@@ -103,25 +109,26 @@ cron_menu() {
                 list_user_crons "$user"
                 read -p "Enter drücken zum Fortfahren..."
                 ;;
-            2)
-                read -p "Systemweit (s) oder Benutzer-spezifisch (u)? " cron_scope
-                if [ "$cron_scope" = "u" ]; then
-                    read -p "Benutzer: " user
-                    cron_type="user"
-                else
-                    user="root"
-                    cron_type="system"
-                fi
-                read -p "Schedule (z.B. '0 4 * * *' für täglich um 4 Uhr): " schedule
-                read -p "Befehl: " command
-                
-                if add_cron "$user" "$schedule" "$command" "$cron_type"; then
-                    echo "Cronjob erfolgreich hinzugefügt!"
-                else
-                    echo "Fehler beim Hinzufügen des Cronjobs!"
-                fi
-                read -p "Enter drücken zum Fortfahren..."
-                ;;
+           2)
+               read -p "Systemweit (s) oder Benutzer-spezifisch (u)? " cron_scope
+               if [ "$cron_scope" = "u" ]; then
+                   read -p "Benutzer: " user
+                   cron_type="user"
+               else
+                   user="root"
+                   cron_type="system"
+               fi
+               read -r -p "Schedule (z.B. '0 4 * * *' für täglich um 4 Uhr): " schedule
+               read -r -p "Befehl: " command
+               read -r -p "Name für den Cronjob (Enter für automatischen Namen): " name
+
+               if add_cron "$user" "$schedule" "$command" "$cron_type" "$name"; then
+                   echo "Cronjob erfolgreich hinzugefügt!"
+               else
+                   echo "Fehler beim Hinzufügen des Cronjobs!"
+               fi
+               read -p "Enter drücken zum Fortfahren..."
+               ;;
             3)
                 read -p "Systemweit (s) oder Benutzer-spezifisch (u)? " cron_scope
                 if [ "$cron_scope" = "u" ]; then

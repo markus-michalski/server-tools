@@ -1,5 +1,6 @@
 #!/bin/bash
 
+# Gemeinsame Funktionen laden
 source /root/server-tools/common-functions.sh
 
 # DocRoot Funktionen
@@ -52,30 +53,7 @@ add_docroot() {
 
     ln -s "$docroot" "/home/$username/www-${final_link_name}"
 
-    # Validierung der Berechtigungen
-    echo "Überprüfe Berechtigungen..."
-    local test_dir="${docroot}/test_folder_$$"
-    sudo -u "$username" mkdir -p "$test_dir"
-
-    if [ $? -eq 0 ]; then
-        echo "✓ Berechtigungstest erfolgreich"
-        ls -la "$test_dir"
-        echo "ACL-Berechtigungen:"
-        getfacl "$test_dir"
-        rm -rf "$test_dir"
-    else
-        echo "! Warnung: Berechtigungstest fehlgeschlagen"
-    fi
-
-    echo "DocRoot Setup abgeschlossen:"
-    echo "✓ ACL-Berechtigungen gesetzt"
-    echo "✓ Default-ACL für neue Dateien konfiguriert"
-    echo "✓ Symbolischer Link erstellt: www-${final_link_name}"
-
-    # Zeige finale ACL-Berechtigungen
-    echo -e "\nAktuelle ACL-Berechtigungen:"
-    getfacl "$docroot"
-
+    echo "DocRoot Setup abgeschlossen"
     return 0
 }
 
@@ -109,7 +87,6 @@ repair_acl_permissions() {
     getfacl "$docroot"
 }
 
-# Funktion zum Reparieren bestehender Berechtigungen
 repair_docroot_permissions() {
     local username=$1
     local is_developer=$2
@@ -121,7 +98,15 @@ repair_docroot_permissions() {
 
     echo "Repariere DocRoot-Berechtigungen für User ${username}..."
 
-    # Finde alle DocRoots des Users
+    # Prüfe ob es ein Chroot-User ist
+    if [ -d "/var/www/jails/${username}" ]; then
+        local docroot="/var/www/${username}"
+        chown -R "${username}:www-data" "$docroot"
+        chmod 750 "$docroot"
+        return 0
+    fi
+
+    # Für Standard/Entwickler-User
     for link in /home/${username}/www-*; do
         if [ -L "$link" ]; then
             local docroot=$(readlink -f "$link")
@@ -149,20 +134,6 @@ repair_docroot_permissions() {
                 done
                 echo
 
-                # Spezielle Verzeichnisse für Nextcloud
-                if [ -d "${docroot}/config" ] || [ -d "${docroot}/data" ] || [ -d "${docroot}/apps" ]; then
-                    echo "Verarbeite Nextcloud-Verzeichnisse..."
-                    for dir in "config" "data" "apps" "apps-external" "assets" ".well-known"; do
-                        if [ -d "${docroot}/${dir}" ]; then
-                            echo "   Setze Berechtigungen für ${dir}"
-                            chown -R www-data:www-data "${docroot}/${dir}"
-                            chmod 775 "${docroot}/${dir}"
-                            find "${docroot}/${dir}" -type d -exec chmod 775 {} \;
-                            find "${docroot}/${dir}" -type f -exec chmod 664 {} \;
-                        fi
-                    done
-                fi
-
                 echo "DocRoot $docroot wurde verarbeitet"
                 echo "----------------------------------------"
             fi
@@ -170,15 +141,97 @@ repair_docroot_permissions() {
     done
 
     echo "DocRoot-Berechtigungen wurden aktualisiert!"
-    echo "Bitte teste die Berechtigungen durch Erstellen eines neuen Ordners."
 }
 
-# SSH User erstellen
+# Chroot User Funktionen
+create_secure_chroot_user() {
+    local username=$1
+    local password=$2
+    local web_root=${3:-"/var/www/${username}"}
+
+    echo "Erstelle Chroot-User: $username"
+
+    # Basis-Verzeichnisstruktur
+    local jail_root="/var/www/jails/${username}"
+
+    # Erstelle notwendige Verzeichnisse
+    mkdir -p "${web_root}"
+    mkdir -p "${jail_root}"
+
+    # Erstelle User mit chroot Shell
+    useradd -d "${jail_root}" \
+            -g www-data \
+            -s /usr/sbin/jk_chrootsh \
+            "${username}"
+
+    # Setze Passwort
+    echo "${username}:${password}" | chpasswd
+
+    # Installiere jailkit falls nicht vorhanden
+    if ! command -v jk_init &> /dev/null; then
+        apt-get update && apt-get install -y jailkit
+    fi
+
+    # Initialisiere chroot mit benötigten Tools
+    jk_init -v "${jail_root}" basicshell editors extendedshell git ssh sftp scp rsync
+
+    # Kopiere zusätzliche Bibliotheken
+    mkdir -p "${jail_root}/usr/lib/x86_64-linux-gnu/"
+    cp /usr/lib/x86_64-linux-gnu/libssl.so* "${jail_root}/usr/lib/x86_64-linux-gnu/"
+    cp /usr/lib/x86_64-linux-gnu/libcrypto.so* "${jail_root}/usr/lib/x86_64-linux-gnu/"
+
+    # Web-Verzeichnis Berechtigungen
+    chown -R "${username}:www-data" "${web_root}"
+    chmod 750 "${web_root}"
+
+    # SSH Setup im Jail
+    mkdir -p "${jail_root}/.ssh"
+    chmod 700 "${jail_root}/.ssh"
+    touch "${jail_root}/.ssh/authorized_keys"
+    chmod 600 "${jail_root}/.ssh/authorized_keys"
+    chown -R "${username}:www-data" "${jail_root}/.ssh"
+
+    # Erstelle Web-Verzeichnis Link im Jail
+    ln -s "${web_root}" "${jail_root}/web"
+
+    # SSH Konfiguration
+    cat >> /etc/ssh/sshd_config << EOF
+
+# Secure Chroot Config für ${username}
+Match User ${username}
+    ChrootDirectory ${jail_root}
+    X11Forwarding no
+    AllowTcpForwarding no
+    ForceCommand internal-sftp
+EOF
+
+    # .bashrc im Jail
+    cat > "${jail_root}/.bashrc" << EOF
+export PS1='\u@\h:\w\$ '
+export PATH=/usr/local/bin:/usr/bin:/bin
+alias ll='ls -la'
+cd /web
+EOF
+
+    # Finale Berechtigungen
+    chown root:root "${jail_root}"
+    chmod 755 "${jail_root}"
+
+    # Neustart SSH
+    systemctl restart sshd
+
+    echo "=== Chroot-User Setup abgeschlossen ==="
+    echo "Web-Verzeichnis: ${web_root}"
+    echo "Jail-Verzeichnis: ${jail_root}"
+    echo "SSH-Zugriff: ssh -p 62954 ${username}@domain"
+    echo "SFTP-Zugriff: sftp -P 62954 ${username}@domain"
+}
+
+# Standard SSH User erstellen
 create_ssh_user() {
     local username=$1
     local password=$2
     local is_developer=$3
-    local docroot=$4  # Optional: wird beim DocRoot Setup abgefragt wenn nicht angegeben
 
     if [ -z "$username" ]; then
         echo "Fehler: Kein Username angegeben!"
@@ -210,7 +263,6 @@ create_ssh_user() {
 
     # Basis-Verzeichnisstruktur
     if [ "$is_developer" = "true" ]; then
-        # Entwickler-Verzeichnisstruktur
         mkdir -p "/home/${username}/"{bin,dev,logs}
 
         # Entwickler-Tools verlinken
@@ -247,36 +299,7 @@ export NODE_ENV="development"
 export PHP_ENV="development"
 EOF
 
-        # PHP-FPM Pool für Entwickler
-        cat > "/etc/php/8.2/fpm/pool.d/${username}.conf" << EOF
-[${username}]
-user = ${username}
-group = www-data
-listen = /run/php/php8.2-fpm.${username}.sock
-listen.owner = www-data
-listen.group = www-data
-pm = dynamic
-pm.max_children = 5
-pm.start_servers = 2
-pm.min_spare_servers = 1
-pm.max_spare_servers = 3
-EOF
-
-        # Logrotation für Entwickler
-        cat > "/etc/logrotate.d/${username}" << EOF
-/home/${username}/logs/bash_history.log {
-    weekly
-    rotate 12
-    compress
-    delaycompress
-    missingok
-    notifempty
-    create 640 ${username} ${username}
-}
-EOF
-
     else
-        # Standard-User Verzeichnisstruktur
         mkdir -p "/home/${username}/bin"
 
         # Standard-Befehle
@@ -296,80 +319,15 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/
 EOF
     fi
 
-    # DocRoot Setup
-    echo "DocRoot Setup"
-    local add_more="j"
-    while [[ "$add_more" == "j" || "$add_more" == "J" ]]; do
-        read -p "DocRoot-Pfad (oder Enter für überspringen): " docroot
-        if [ ! -z "$docroot" ]; then
-            add_docroot "$username" "$docroot" "$is_developer"
-        fi
-        read -p "Weiteren DocRoot hinzufügen? (j/N): " add_more
-    done
-
-    # SSH Konfiguration
-    sed -i "/Match User ${username}/,+10d" /etc/ssh/sshd_config
-    cat >> /etc/ssh/sshd_config << EOF
-
-# SSH-Konfiguration für ${username}
-Match User ${username}
-    X11Forwarding no
-    AllowTcpForwarding no
-    PermitTunnel no
-    AllowAgentForwarding no
-EOF
-
-    # SSH Key oder Passwort Setup
-    if [ "$use_key" = "true" ]; then
-        if [ "$generate_key" = "true" ]; then
-            generate_ssh_key "$username"
-        elif [ ! -z "$ssh_key" ]; then
-            add_ssh_key "$username" "$ssh_key"
-        else
-            echo "Fehler: Weder SSH-Key angegeben noch Generierung gewählt!"
-            return 1
-        fi
-    else
-        if [ -z "$password" ]; then
-            echo "Fehler: Kein Passwort angegeben!"
-            return 1
-        fi
-        echo "${username}:${password}" | chpasswd
-    fi
-
     # Setze finale Berechtigungen
     chown -R "${username}:www-data" "/home/${username}"
     chmod 750 "/home/${username}"
     chmod 755 "/home/${username}/bin"
 
-    # Services neustarten
-    systemctl restart sshd
-    [ "$is_developer" = "true" ] && systemctl restart php8.2-fpm
-
-    # Erfolgsausgabe
     echo "SSH-User ${username} wurde erstellt!"
-    if [ "$is_developer" = "true" ]; then
-        echo "Entwickler-Account wurde konfiguriert mit:"
-        echo "- Eigener PHP-FPM Pool"
-        echo "- Entwickler-Tools (git, composer, etc.)"
-        echo "- Command Logging"
-        echo "- Erweiterte Berechtigungen"
-    fi
-    echo "SSH-Zugriff: ssh ${username}@domain"
-    echo "SFTP-Zugriff: sftp ${username}@domain"
-    echo "Verfügbare DocRoots:"
-    list_docroots "$username"
 }
 
-# Liste alle DocRoots eines Users auf
-list_docroots() {
-    local username=$1
-
-    echo "DocRoots für User $username:"
-    ls -la "/home/$username/" | grep "^l.*www-" | awk '{print $9 " -> " $11}'
-}
-
-# SSH User löschen
+# User löschen
 delete_ssh_user() {
     local username=$1
 
@@ -393,80 +351,72 @@ delete_ssh_user() {
     # Beende alle Prozesse des Users
     pkill -u "$username"
 
-    # Entferne SFTP/SSH-Konfiguration
-    sed -i "/Match User ${username}/,+10d" /etc/ssh/sshd_config
-
-   # Backup des Home-Verzeichnisses
-       if [ -d "/home/${username}" ]; then
-           read -p "Backup des Home-Verzeichnisses erstellen? (j/N): " backup
-           if [[ "$backup" == "j" || "$backup" == "J" ]]; then
-               backup_dir="/root/user_backups"
-               mkdir -p "$backup_dir"
-               timestamp=$(date +%Y%m%d_%H%M%S)
-                           tar czf "${backup_dir}/${username}_backup_${timestamp}.tar.gz" "/home/${username}" 2>/dev/null
-                           echo "Backup erstellt unter: ${backup_dir}/${username}_backup_${timestamp}.tar.gz"
-                       fi
-                   fi
-
-                   # Entferne PHP-FPM Pool falls vorhanden
-                   if [ -f "/etc/php/8.2/fpm/pool.d/${username}.conf" ]; then
-                       rm "/etc/php/8.2/fpm/pool.d/${username}.conf"
-                       systemctl restart php8.2-fpm
-                   fi
-
-                   # Entferne Logrotation falls vorhanden
-                   if [ -f "/etc/logrotate.d/${username}" ]; then
-                       rm "/etc/logrotate.d/${username}"
-                   fi
-
-                   # Lösche User und Home-Verzeichnis
-                   userdel -r "$username" 2>/dev/null || {
-                       echo "Standard-Löschung fehlgeschlagen, versuche forcierte Löschung..."
-                       userdel "$username" 2>/dev/null
-                       rm -rf "/home/${username}" 2>/dev/null
-                   }
-
-                   # Neustart SSH Service
-                   systemctl restart sshd
-
-                   echo "User ${username} wurde gelöscht!"
-               }
-# SSH Key für User generieren
-generate_ssh_key() {
-    local username=$1
-    local key_type=${2:-"ed25519"}
-    local key_comment=${3:-"${username}@$(hostname)"}
-
-    if [ -z "$username" ]; then
-        echo "Fehler: Kein Username angegeben!"
-        return 1
+    # Backup des Home-Verzeichnisses
+    if [ -d "/home/${username}" ]; then
+        read -p "Backup des Home-Verzeichnisses erstellen? (j/N): " backup
+        if [[ "$backup" == "j" || "$backup" == "J" ]]; then
+            backup_dir="/root/user_backups"
+            mkdir -p "$backup_dir"
+            timestamp=$(date +%Y%m%d_%H%M%S)
+            tar czf "${backup_dir}/${username}_backup_${timestamp}.tar.gz" "/home/${username}" 2>/dev/null
+            echo "Backup erstellt unter: ${backup_dir}/${username}_backup_${timestamp}.tar.gz"
+        fi
     fi
 
-    if ! id "$username" &>/dev/null; then
-        echo "Fehler: User ${username} existiert nicht!"
-        return 1
-    fi
+    # Lösche User und Home-Verzeichnis
+    userdel -r "$username" 2>/dev/null || {
+        echo "Standard-Löschung fehlgeschlagen, versuche forcierte Löschung..."
+        userdel "$username" 2>/dev/null
+        rm -rf "/home/${username}" 2>/dev/null
+    }
 
-    local ssh_dir="/home/${username}/.ssh"
-    mkdir -p "$ssh_dir"
-
-    if [ "$key_type" = "ed25519" ]; then
-        ssh-keygen -t ed25519 -C "$key_comment" -f "${ssh_dir}/id_ed25519" -N ""
-    else
-        ssh-keygen -t rsa -b 4096 -C "$key_comment" -f "${ssh_dir}/id_rsa" -N ""
-    fi
-
-    chmod 700 "$ssh_dir"
-    chmod 600 "${ssh_dir}/id_${key_type}"
-    chmod 644 "${ssh_dir}/id_${key_type}.pub"
-    chown -R "${username}:www-data" "$ssh_dir"
-
-    echo "SSH-Key wurde generiert!"
-    echo "Öffentlicher Schlüssel:"
-    cat "${ssh_dir}/id_${key_type}.pub"
+    echo "User ${username} wurde gelöscht!"
 }
 
-# SSH Key zu bestehendem User hinzufügen
+# Chroot User löschen
+delete_chroot_user() {
+    local username=$1
+
+    echo "Lösche Chroot-User: $username"
+
+    # Pfade
+    local web_root="/var/www/${username}"
+    local jail_root="/var/www/jails/${username}"
+
+    # Backup erstellen
+    local backup_dir="/root/user_backups"
+    mkdir -p "${backup_dir}"
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+
+    echo "Erstelle Backup..."
+    tar czf "${backup_dir}/${username}_backup_${timestamp}.tar.gz" "${web_root}" "${jail_root}" 2>/dev/null
+
+    # User und Verzeichnisse entfernen
+    userdel -f "${username}" 2>/dev/null
+    rm -rf "${web_root}" "${jail_root}"
+
+    # SSH-Config entfernen
+    sed -i "/# Secure Chroot Config für ${username}/,+5d" /etc/ssh/sshd_config
+
+    # SSH neu starten
+    systemctl restart sshd
+
+    echo "Chroot-User wurde gelöscht!"
+    echo "Backup erstellt: ${backup_dir}/${username}_backup_${timestamp}.tar.gz"
+}
+
+# Hilfsfunktionen für SSH Key Management
+list_ssh_users() {
+    echo "=== SSH User ==="
+    echo "Standard und Entwickler User:"
+    awk -F: '$7 ~ /\/bin\/bash/ {print "- " $1}' /etc/passwd
+    echo
+    echo "Chroot User:"
+    find "/var/www/jails" -maxdepth 1 -mindepth 1 -type d -exec basename {} \; | while read user; do
+        echo "- $user (chroot)"
+    done
+}
+
 add_ssh_key() {
     local username=$1
     local ssh_key=$2
@@ -476,36 +426,52 @@ add_ssh_key() {
         return 1
     fi
 
-    if ! id "$username" &>/dev/null; then
-        echo "Fehler: User ${username} existiert nicht!"
-        return 1
+    # Prüfe ob es ein Chroot-User ist
+    if [ -d "/var/www/jails/$username" ]; then
+        local ssh_dir="/var/www/jails/${username}/.ssh"
+    else
+        local ssh_dir="/home/${username}/.ssh"
     fi
-
-    if ! validate_ssh_key "$ssh_key"; then
-        echo "Fehler: Ungültiges SSH-Key Format!"
-        return 1
-    fi
-
-    local ssh_dir="/home/${username}/.ssh"
-    local auth_keys="${ssh_dir}/authorized_keys"
 
     mkdir -p "$ssh_dir"
-
-    if ! grep -q "$ssh_key" "$auth_keys" 2>/dev/null; then
-        echo "$ssh_key" >> "$auth_keys"
-    else
-        echo "SSH-Key existiert bereits!"
-        return 1
-    fi
-
+    echo "$ssh_key" >> "${ssh_dir}/authorized_keys"
     chmod 700 "$ssh_dir"
-    chmod 600 "$auth_keys"
+    chmod 600 "${ssh_dir}/authorized_keys"
     chown -R "${username}:www-data" "$ssh_dir"
 
     echo "SSH-Key wurde hinzugefügt!"
 }
 
-# SSH Keys eines Users anzeigen
+generate_ssh_key() {
+    local username=$1
+    local key_type=${2:-"ed25519"}
+
+    if [ -z "$username" ]; then
+        echo "Fehler: Kein Username angegeben!"
+        return 1
+    fi
+
+    # Prüfe ob es ein Chroot-User ist
+    if [ -d "/var/www/jails/$username" ]; then
+        local ssh_dir="/var/www/jails/${username}/.ssh"
+    else
+        local ssh_dir="/home/${username}/.ssh"
+    fi
+
+    mkdir -p "$ssh_dir"
+
+    if [ "$key_type" = "ed25519" ]; then
+        ssh-keygen -t ed25519 -f "${ssh_dir}/id_ed25519" -N "" -C "${username}@$(hostname)"
+    else
+        ssh-keygen -t rsa -b 4096 -f "${ssh_dir}/id_rsa" -N "" -C "${username}@$(hostname)"
+    fi
+
+    chmod 700 "$ssh_dir"
+    chown -R "${username}:www-data" "$ssh_dir"
+
+    echo "SSH-Key wurde generiert!"
+}
+
 list_ssh_keys() {
     local username=$1
 
@@ -514,12 +480,12 @@ list_ssh_keys() {
         return 1
     fi
 
-    if ! id "$username" &>/dev/null; then
-        echo "Fehler: User ${username} existiert nicht!"
-        return 1
+    # Prüfe ob es ein Chroot-User ist
+    if [ -d "/var/www/jails/$username" ]; then
+        local auth_keys="/var/www/jails/${username}/.ssh/authorized_keys"
+    else
+        local auth_keys="/home/${username}/.ssh/authorized_keys"
     fi
-
-    local auth_keys="/home/${username}/.ssh/authorized_keys"
 
     if [ -f "$auth_keys" ]; then
         echo "SSH-Keys für User ${username}:"
@@ -529,25 +495,16 @@ list_ssh_keys() {
     fi
 }
 
-# SSH User auflisten
-list_ssh_users() {
-    echo "=== SSH User ==="
-    echo "Folgende SSH-User sind konfiguriert:"
-    awk -F: '$7 ~ /\/bin\/bash/ || $7 ~ /\/bin\/rbash/ {print "- " $1}' /etc/passwd
-}
-
-# SSH User zu Entwickler upgraden
 upgrade_to_dev() {
     local username=$1
-    local docroot=$2
 
     if [ -z "$username" ]; then
         echo "Fehler: Kein Username angegeben!"
         return 1
     fi
 
-    if ! id "$username" &>/dev/null; then
-        echo "Fehler: User ${username} existiert nicht!"
+    if [ -d "/var/www/jails/$username" ]; then
+        echo "Chroot-User können nicht zu Entwickler-Accounts upgegradet werden!"
         return 1
     fi
 
@@ -558,54 +515,28 @@ upgrade_to_dev() {
         return 1
     fi
 
-    # Temporär User löschen und neu erstellen
-    local temp_key=""
+    # Backup der SSH-Keys
+    local temp_keys=""
     if [ -f "/home/${username}/.ssh/authorized_keys" ]; then
-        temp_key=$(cat "/home/${username}/.ssh/authorized_keys")
+        temp_keys=$(cat "/home/${username}/.ssh/authorized_keys")
     fi
 
+    # User neu erstellen als Entwickler
     delete_ssh_user "$username"
     sleep 2
+    create_ssh_user "$username" "" "true"
 
-    if [ ! -z "$temp_key" ]; then
-        create_ssh_user "$username" "$password" "true"  # Als Entwickler
-    else
-        read -s -p "Neues Passwort für Entwickler-Account: " password
-        echo
-        create_ssh_user "$username" "$password" "true"  # Als Entwickler
+    # SSH-Keys wiederherstellen
+    if [ ! -z "$temp_keys" ]; then
+        echo "$temp_keys" > "/home/${username}/.ssh/authorized_keys"
+        chmod 600 "/home/${username}/.ssh/authorized_keys"
+        chown "${username}:www-data" "/home/${username}/.ssh/authorized_keys"
     fi
+
+    echo "User wurde zu einem Entwickler-Account upgegradet!"
 }
 
-# Entferne einen DocRoot
-remove_docroot() {
-    local username=$1
-    local docroot=$2
-
-    if [ -z "$username" ] || [ -z "$docroot" ]; then
-        echo "Fehler: Username und DocRoot müssen angegeben werden!"
-        return 1
-    fi
-
-    local link_name=$(basename "$docroot")
-
-    # Entferne ACL-Einträge
-    if setfacl --remove-all -R "$docroot" 2>/dev/null; then
-        echo "ACL-Einträge wurden entfernt"
-    fi
-
-    # Suche und entferne alle Links die auf diesen DocRoot zeigen
-    for link in /home/$username/www-*; do
-        if [ -L "$link" ] && [ "$(readlink "$link")" = "$docroot" ]; then
-            rm "$link"
-            echo "DocRoot-Link entfernt: $(basename "$link")"
-        fi
-    done
-
-    echo "DocRoot wurde erfolgreich entfernt"
-    return 0
-}
-
-# Erweitertes DocRoot-Management
+# DocRoot Management Menü
 manage_docroots() {
     local username=$1
     local submenu=true
@@ -624,8 +555,7 @@ manage_docroots() {
         case $choice in
             1)
                 read -p "Pfad zum neuen DocRoot (oder 'q' für abbrechen): " new_docroot
-                [ "$new_docroot" = "q" ] && continue
-                if [ ! -z "$new_docroot" ]; then
+                if [ "$new_docroot" != "q" ] && [ ! -z "$new_docroot" ]; then
                     if grep -q "/bin/bash" <(getent passwd "$username"); then
                         add_docroot "$username" "$new_docroot" "true"
                     else
@@ -669,7 +599,7 @@ manage_docroots() {
     done
 }
 
-# SSH User Management Menü
+# Hauptmenü-Funktion
 ssh_menu() {
     local submenu=true
 
@@ -678,27 +608,28 @@ ssh_menu() {
         echo "=== SSH User Management ==="
         echo "1. Standard SSH-User erstellen"
         echo "2. Entwickler SSH-User erstellen"
-        echo "3. SSH-User löschen"
-        echo "4. SSH-User anzeigen"
-        echo "5. SSH-Key zu bestehendem User hinzufügen"
-        echo "6. Neuen SSH-Key für User generieren"
-        echo "7. SSH-Keys eines Users anzeigen"
-        echo "8. User zu Entwickler-Account upgraden"
-        echo "9. DocRoots verwalten"
-        echo "10. DocRoot-Berechtigungen reparieren"
-        echo "11. ACL-Berechtigungen reparieren"
-        echo "12. Zurück zum Hauptmenü"
+        echo "3. Secure Chroot-User erstellen (ISPConfig-Style)"
+        echo "4. SSH-User löschen"
+        echo "5. SSH-User anzeigen"
+        echo "6. SSH-Key zu bestehendem User hinzufügen"
+        echo "7. Neuen SSH-Key für User generieren"
+        echo "8. SSH-Keys eines Users anzeigen"
+        echo "9. User zu Entwickler-Account upgraden"
+        echo "10. DocRoots verwalten"
+        echo "11. DocRoot-Berechtigungen reparieren"
+        echo "12. ACL-Berechtigungen reparieren"
+        echo "13. Zurück zum Hauptmenü"
         echo
-        read -r -p "Wähle eine Option (1-12): " choice
+        read -r -p "Wähle eine Option (1-13): " choice
 
         case $choice in
             1)
-              echo
+                echo
                 read -p "Username (oder 'q' für abbrechen): " username
                 [ "$username" = "q" ] && continue
                 read -s -p "Passwort: " password
                 echo
-                create_ssh_user "$username" "$password" "false"  # Standard-User
+                create_ssh_user "$username" "$password" "false"
                 ;;
             2)
                 echo
@@ -706,21 +637,37 @@ ssh_menu() {
                 [ "$username" = "q" ] && continue
                 read -s -p "Passwort: " password
                 echo
-                create_ssh_user "$username" "$password" "true"   # Entwickler-Account
+                create_ssh_user "$username" "$password" "true"
                 ;;
             3)
+                echo
+                read -p "Username (oder 'q' für abbrechen): " username
+                [ "$username" = "q" ] && continue
+                read -s -p "Passwort: " password
+                echo
+                read -p "Web-Verzeichnis [/var/www/$username]: " web_root
+                web_root=${web_root:-"/var/www/$username"}
+                create_secure_chroot_user "$username" "$password" "$web_root"
+                ;;
+            4)
                 echo
                 list_ssh_users
                 echo
                 read -p "Username zum Löschen (oder 'q' für abbrechen): " username
                 [ "$username" = "q" ] && continue
-                delete_ssh_user "$username"
+
+                # Prüfe ob es ein Chroot-User ist
+                if [ -d "/var/www/jails/$username" ]; then
+                    delete_chroot_user "$username"
+                else
+                    delete_ssh_user "$username"
+                fi
                 ;;
-            4)
+            5)
                 echo
                 list_ssh_users
                 ;;
-            5)
+            6)
                 echo
                 list_ssh_users
                 echo
@@ -730,7 +677,7 @@ ssh_menu() {
                 read ssh_key
                 add_ssh_key "$username" "$ssh_key"
                 ;;
-            6)
+            7)
                 echo
                 list_ssh_users
                 echo
@@ -740,7 +687,7 @@ ssh_menu() {
                 [ -z "$key_type" ] && key_type="ed25519"
                 generate_ssh_key "$username" "$key_type"
                 ;;
-            7)
+            8)
                 echo
                 list_ssh_users
                 echo
@@ -748,7 +695,7 @@ ssh_menu() {
                 [ "$username" = "q" ] && continue
                 list_ssh_keys "$username"
                 ;;
-            8)
+            9)
                 echo
                 list_ssh_users
                 echo
@@ -756,7 +703,7 @@ ssh_menu() {
                 [ "$username" = "q" ] && continue
                 upgrade_to_dev "$username"
                 ;;
-            9)
+            10)
                 echo
                 list_ssh_users
                 echo
@@ -769,7 +716,7 @@ ssh_menu() {
                     read -p "Enter drücken zum Fortfahren..."
                 fi
                 ;;
-            10)
+            11)
                 echo
                 list_ssh_users
                 echo
@@ -787,7 +734,7 @@ ssh_menu() {
                 fi
                 read -p "Enter drücken zum Fortfahren..."
                 ;;
-            11)
+            12)
                 echo
                 list_ssh_users
                 echo
@@ -801,7 +748,7 @@ ssh_menu() {
                 fi
                 read -p "Enter drücken zum Fortfahren..."
                 ;;
-            12)
+            13)
                 submenu=false
                 continue
                 ;;
@@ -810,10 +757,19 @@ ssh_menu() {
                 ;;
         esac
 
-        if [ "$choice" != "12" ]; then
+        if [ "$choice" != "13" ]; then
             echo
             read -p "Enter drücken zum Fortfahren..."
             clear
         fi
     done
 }
+
+# Hauptprogramm
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    if [ "$EUID" -ne 0 ]; then
+        echo "Dieses Script muss als root ausgeführt werden!"
+        exit 1
+    fi
+    ssh_menu
+fi

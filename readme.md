@@ -175,11 +175,12 @@ Important Notes:
 ### SSH User Management (`ssh-functions.sh`)
 
 Features:
-- Create standard/developer users
+- Create standard/developer/chroot users
 - SSH key management
 - DocRoot setup with ACL permissions
 - PHP-FPM pools for developers
 - Security hardening
+- Chroot environment management
 
 Permission Management:
 - ACL-based permission system
@@ -200,6 +201,42 @@ User Types:
    - Custom PHP-FPM pool
    - Git/Composer support
    - Enhanced ACL permissions
+
+3. Chroot Users (ISPConfig-Style):
+   - Completely isolated environment
+   - Restricted to their own directory
+   - SFTP access only
+   - Secure jailed environment
+   - Ideal for web hosting clients
+
+Example Usage:
+```bash
+# Through main menu:
+servertools
+# Select SSH User Management
+# Choose from options:
+# 1. Create Standard SSH User
+# 2. Create Developer SSH User
+# 3. Create Secure Chroot User
+# ... other management options
+
+# For creating a chroot user:
+# 1. Select option 3
+# 2. Enter username and password
+# 3. Specify web directory (optional)
+# System will automatically:
+# - Set up chroot jail
+# - Configure SFTP access
+# - Set correct permissions
+# - Create necessary directories
+```
+
+Best Practices:
+- Use chroot users for external clients
+- Use developer accounts for trusted developers
+- Standard users for basic web management
+- Regularly check permissions with repair options
+- Always use SSH keys when possible
 
 ### Cron Management (`cron-functions.sh`)
 

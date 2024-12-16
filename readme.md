@@ -117,15 +117,60 @@ Requirements:
 
 Features:
 - Create/delete databases
-- User management
+- Create/delete database users
 - Secure password generation
 - Automatic backup integration
 - UTF8MB4 charset default
+- Granular operations:
+   - Create database with new user
+   - Create database for existing user
+   - Delete database while keeping user
+   - Delete user while keeping databases
+   - Show affected users for database operations
 
 Security:
 - Credentials stored in `/root/db-credentials/`
 - Automatic permission management
 - Backup before deletions
+- Clear visibility of affected users/databases
+
+Menu Options:
+1. Create Database & User
+2. Delete Database & User
+3. Show Databases & Users
+4. Create Database for Existing User
+5. Delete Database Only (keep user)
+6. Delete User Only
+
+Example Usage:
+```bash
+# Through main menu:
+servertools
+# Select Database Management
+# Choose from available options
+
+# Creating new database with user:
+# - Automatically generates secure password if none provided
+# - Creates credentials file
+# - Sets up proper permissions
+
+# Deleting database only:
+# - Shows which users have access to the database
+# - Offers options for credentials file handling
+# - Keeps associated users intact
+
+# Deleting user only:
+# - Shows which databases the user has access to
+# - Indicates if databases still exist
+# - Removes user while preserving databases
+```
+
+Important Notes:
+- All database names and users are validated
+- Credentials are automatically backed up
+- Clear feedback about existing/non-existing resources
+- Safe deletion procedures with confirmation
+
 
 ### SSH User Management (`ssh-functions.sh`)
 

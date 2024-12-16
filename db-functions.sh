@@ -21,6 +21,26 @@ mysql_cmd() {
     mysql -u"${MYSQL_USER}" -p"${MYSQL_PASS}" -e "$1"
 }
 
+# Betroffene User einer Datenbank finden
+find_database_users() {
+    local db_name=$1
+    local users=""
+
+    # Hole alle User (außer System-User)
+    while read -r user host; do
+        if [[ -n "$user" && "$host" == "localhost" ]]; then
+            # Prüfe nur auf spezifische Datenbankrechte
+            if mysql_cmd "SHOW GRANTS FOR '${user}'@'localhost'" 2>/dev/null | grep -qi "ON \`${db_name}\`\."; then
+                users="${users}${user}\n"
+            fi
+        fi
+    done < <(mysql_cmd "SELECT user, host FROM mysql.user WHERE user NOT IN ('root', 'debian-sys-maint', 'mysql.sys', 'mysql.session', 'mariadb.sys', 'mysql', 'phpmyadmin', 'pma')")
+
+    if [[ -n "$users" ]]; then
+        echo -e "$users" | sort | uniq
+    fi
+}
+
 # Datenbank und User erstellen
 create_db() {
     local db_name=$1
@@ -94,7 +114,6 @@ create_db() {
     fi
 }
 
-
 # Neue DB für existierenden User
 assign_db_to_user() {
     local db_name=$1
@@ -122,6 +141,53 @@ assign_db_to_user() {
     mysql_cmd "FLUSH PRIVILEGES;"
 
     echo "✅ Datenbank ${db_name} wurde ${db_user} zugewiesen!"
+}
+
+# Nur User löschen
+delete_user() {
+    local db_user=$1
+
+    echo "⚠️  ACHTUNG: Datenbankbenutzer ${db_user} wird gelöscht!"
+    echo "Alle Zugriffsrechte des Users werden entfernt."
+    read -p "Fortfahren? (j/N): " confirm
+    if [[ "$confirm" != "j" && "$confirm" != "J" ]]; then
+        return 1
+    fi
+
+    # Prüfe ob User existiert
+    if ! mysql_cmd "SELECT user FROM mysql.user WHERE user='${db_user}'" | grep -q "${db_user}"; then
+        echo "User ${db_user} existiert nicht!"
+        return 1
+    fi
+
+    # Liste alle Datenbanken, auf die der User Zugriff hat
+    echo "User hat Zugriff auf folgende Datenbanken:"
+
+    # Hole alle GRANT-Statements und extrahiere Datenbanknamen
+    mysql_cmd "SHOW GRANTS FOR '${db_user}'@'localhost'" 2>/dev/null | while read -r grant; do
+        # Überspringe Globale Rechte (USAGE)
+        if echo "$grant" | grep -q "USAGE ON \*\.\*"; then
+            continue
+        fi
+
+        # Extrahiere Datenbanknamen zwischen Backticks
+        if echo "$grant" | grep -q "ON \`.*\`\."; then
+            db_name=$(echo "$grant" | sed -n "s/.*ON \`\(.*\)\`\..*/\1/p")
+            if [ -n "$db_name" ]; then
+                # Prüfe ob die Datenbank noch existiert
+                if mysql_cmd "SHOW DATABASES LIKE '${db_name}'" | grep -q "${db_name}"; then
+                    echo "- ${db_name} (existiert)"
+                else
+                    echo "- ${db_name} (existiert nicht mehr)"
+                fi
+            fi
+        fi
+    done
+
+    mysql_cmd "DROP USER '${db_user}'@'localhost';"
+    mysql_cmd "FLUSH PRIVILEGES;"
+
+    echo "✅ Datenbankbenutzer wurde erfolgreich gelöscht!"
 }
 
 # Datenbank und User löschen
@@ -173,11 +239,12 @@ delete_db_only() {
 
     # Finde alle User mit Rechten auf dieser Datenbank
     echo "Betroffene Datenbankbenutzer:"
-    mysql_cmd "SELECT user, host FROM mysql.user WHERE user NOT IN ('root', 'debian-sys-maint', 'mysql.sys', 'mysql.session');" | while read user host; do
-        if mysql_cmd "SHOW GRANTS FOR '${user}'@'${host}'" | grep -q "${db_name}"; then
-            echo "- ${user}"
-        fi
-    done
+    users=$(find_database_users "${db_name}")
+    if [[ -n "$users" ]]; then
+        echo "$users"
+    else
+        echo "Keine User mit spezifischen Rechten gefunden."
+    fi
 
     # Lösche nur die Datenbank
     mysql_cmd "DROP DATABASE IF EXISTS ${db_name};"
@@ -231,9 +298,10 @@ database_menu() {
         echo "3. Datenbanken & User anzeigen"
         echo "4. Neue Datenbank für existierenden User"
         echo "5. Nur Datenbank löschen (User behalten)"
-        echo "6. Zurück zum Hauptmenü"
+        echo "6. Nur User löschen"
+        echo "7. Zurück zum Hauptmenü"
 
-        read -p "Wähle eine Option (1-6): " choice
+        read -p "Wähle eine Option (1-7): " choice
 
         case $choice in
             1)
@@ -242,7 +310,6 @@ database_menu() {
                 read -s -p "Datenbank-Passwort (leer lassen für auto-generiertes Passwort): " db_pass
                 echo
                 if [ -z "$db_pass" ]; then
-                    # Generiere ein sicheres Passwort wenn keins angegeben wurde
                     db_pass=$(openssl rand -base64 12)
                 fi
                 create_db "$db_name" "$db_user" "$db_pass"
@@ -268,6 +335,11 @@ database_menu() {
                 delete_db_only "$db_name"
                 ;;
             6)
+                list_databases
+                read -p "Datenbank-User zum Löschen: " db_user
+                delete_user "$db_user"
+                ;;
+            7)
                 submenu=false
                 ;;
             *)
@@ -275,7 +347,7 @@ database_menu() {
                 ;;
         esac
 
-        if [ "$choice" != "6" ]; then
+        if [ "$choice" != "7" ]; then
             read -p "Enter drücken zum Fortfahren..."
             clear
         fi

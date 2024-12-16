@@ -126,19 +126,34 @@ EOF
 }
 
 # Virtual Host löschen
+# Virtual Host löschen
 delete_vhost() {
     local domain=$1
     local docroot
+    local parent_dir
 
     if [ ! -f "/etc/apache2/sites-available/${domain}.conf" ]; then
         echo "Fehler: Virtual Host für ${domain} existiert nicht!"
         return 1
     fi
 
-    # DocRoot aus der Konfiguration extrahieren
-    docroot=$(grep -i "DocumentRoot" "/etc/apache2/sites-available/${domain}.conf" | head -n1 | awk '{print $2}')
+    # DocRoot sauberer aus der Konfiguration extrahieren
+    docroot=$(grep -i "DocumentRoot" "/etc/apache2/sites-available/${domain}.conf" |
+              head -n1 |
+              sed 's/^[[:space:]]*DocumentRoot[[:space:]]*//i' |
+              sed 's/[[:space:]]*$//g' |
+              sed 's/^"//;s/"$//' |
+              sed "s/^'//;s/'$//")
+
+    # Validiere den extrahierten Pfad
+    if [ -z "$docroot" ] || [ "$docroot" = "/" ]; then
+        echo "Fehler: Ungültiger DocumentRoot gefunden!"
+        return 1
+    fi
 
     echo "ACHTUNG: Virtual Host wird gelöscht!"
+    echo "Domain: ${domain}"
+    echo "DocumentRoot: ${docroot}"
     read -p "Fortfahren? (j/N): " confirm
     if [[ "$confirm" != "j" && "$confirm" != "J" ]]; then
         echo "Abbruch."
@@ -151,17 +166,29 @@ delete_vhost() {
     rm -f "/etc/apache2/sites-available/${domain}.conf"
     rm -f "/etc/apache2/sites-available/${domain}-le-ssl.conf"
 
-    # Optional: DocRoot löschen
+    # DocRoot löschen wenn vorhanden
     if [ ! -z "$docroot" ] && [ -d "$docroot" ]; then
         read -p "DocumentRoot ($docroot) auch löschen? (j/N): " confirm_docroot
         if [[ "$confirm_docroot" == "j" || "$confirm_docroot" == "J" ]]; then
-            rm -rf "$docroot" && echo "DocumentRoot wurde gelöscht."
-            rmdir --ignore-fail-on-non-empty "$(dirname "$docroot")" 2>/dev/null
+            if rm -rf "$docroot"; then
+                echo "DocumentRoot wurde erfolgreich gelöscht."
+
+                # Versuche das übergeordnete Verzeichnis zu löschen, falls es leer ist
+                parent_dir=$(dirname "$docroot")
+                if [ "$parent_dir" != "/" ] && [ "$parent_dir" != "/var/www" ]; then
+                    if rmdir --ignore-fail-on-non-empty "$parent_dir" 2>/dev/null; then
+                        echo "Übergeordnetes Verzeichnis wurde auch gelöscht, da es leer war."
+                    fi
+                fi
+            else
+                echo "Fehler: Konnte DocumentRoot nicht löschen. Überprüfe die Berechtigungen."
+                return 1
+            fi
         fi
     fi
 
     systemctl reload apache2
-    echo "Virtual Host ${domain} wurde gelöscht!"
+    echo "Virtual Host ${domain} wurde erfolgreich gelöscht!"
 }
 
 # Virtual Hosts auflisten

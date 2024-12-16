@@ -405,18 +405,28 @@ delete_chroot_user() {
     echo "Backup erstellt: ${backup_dir}/${username}_backup_${timestamp}.tar.gz"
 }
 
-# Hilfsfunktionen für SSH Key Management
+# Hilfsfunktionen für SSH User Management
 list_ssh_users() {
     echo "=== SSH User ==="
     echo "Standard und Entwickler User:"
     awk -F: '$7 ~ /\/bin\/bash/ {print "- " $1}' /etc/passwd
-    echo
-    echo "Chroot User:"
-    find "/var/www/jails" -maxdepth 1 -mindepth 1 -type d -exec basename {} \; | while read user; do
-        echo "- $user (chroot)"
-    done
+
+    # Prüfe auf Chroot-User nur wenn das Verzeichnis existiert
+    if [ -d "/var/www/jails" ]; then
+        # Zähle die Anzahl der Unterverzeichnisse
+        local chroot_count=$(find "/var/www/jails" -maxdepth 1 -mindepth 1 -type d | wc -l)
+
+        if [ "$chroot_count" -gt 0 ]; then
+            echo
+            echo "Chroot User:"
+            find "/var/www/jails" -maxdepth 1 -mindepth 1 -type d -exec basename {} \; | while read user; do
+                echo "- $user (chroot)"
+            done
+        fi
+    fi
 }
 
+# Hilfsfunktionen für SSH Key Management
 add_ssh_key() {
     local username=$1
     local ssh_key=$2

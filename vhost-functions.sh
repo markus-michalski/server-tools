@@ -2,6 +2,40 @@
 
 source /root/server-tools/common-functions.sh
 
+# DocRoot-Funktion für Chroot-Setup
+add_chroot_docroot() {
+    local username=$1
+    local domain=$2
+
+    if [ -z "$username" ] || [ -z "$domain" ]; then
+        echo "Fehler: Username und Domain müssen angegeben werden!"
+        return 1
+    fi
+
+    # Prüfe ob es ein Chroot-User ist
+    if [ ! -d "/var/www/jails/${username}" ]; then
+        echo "Fehler: ${username} ist kein Chroot-User!"
+        return 1
+    fi
+
+    local web_root="/var/www/${username}"
+    local docroot="${web_root}/html/${domain}"
+
+    echo "Erstelle DocRoot für ${domain}..."
+
+    # Erstelle Domain-Verzeichnis
+    mkdir -p "${docroot}"
+    chown "${username}:www-data" "${docroot}"
+    chmod 750 "${docroot}"
+
+    # Der Link wird automatisch durch den existierenden /web Symlink aufgelöst
+    echo "DocRoot Setup abgeschlossen"
+    echo "Realer Pfad: ${docroot}"
+    echo "Im Chroot sichtbar als: /web/html/${domain}"
+
+    return 0
+}
+
 # Virtual Host erstellen
 create_vhost() {
     local domain=$1
@@ -14,36 +48,59 @@ create_vhost() {
     # Prüfe ob SSH-User existiert
     if ! id "$ssh_user" >/dev/null 2>&1; then
         echo "Fehler: SSH-User $ssh_user existiert nicht!"
-        echo "Bitte zuerst SSH-User anlegen mit create_ssh_user"
         return 1
     fi
 
-    # Prüfe ACL Installation
-    if ! check_acl; then
-        echo "FEHLER: ACL-Setup fehlgeschlagen."
-        return 1
+    # Prüfe ob es ein Chroot-User ist
+    local is_chroot=false
+    if [ -d "/var/www/jails/${ssh_user}" ]; then
+        is_chroot=true
+        echo "Info: ${ssh_user} ist ein Chroot-User"
+
+        # Prüfe Chroot-Struktur
+        if ! verify_chroot_structure "$ssh_user"; then
+            echo "Fehler: Chroot-Struktur ist beschädigt!"
+            read -p "Soll versucht werden, die Struktur zu reparieren? (j/N): " repair
+            if [[ "$repair" == "j" || "$repair" == "J" ]]; then
+                repair_chroot_setup "$ssh_user"
+            else
+                return 1
+            fi
+        fi
     fi
 
-    if [ -z "$custom_docroot" ]; then
-        docroot="/var/www/${domain}/html"
+    if [ "$is_chroot" = true ]; then
+        # Für Chroot-User: DocRoot ist in der festgelegten Struktur
+        docroot="/var/www/${ssh_user}/html/${domain}"
+        if [ ! -z "$custom_docroot" ]; then
+            echo "WARNUNG: Custom DocRoot wird für Chroot-User ignoriert"
+        fi
     else
-        docroot="${custom_docroot}/html"
+        # Für normale User: Standard oder Custom DocRoot
+        if [ -z "$custom_docroot" ]; then
+            docroot="/var/www/${domain}/html"
+        else
+            docroot="${custom_docroot}/html"
+        fi
     fi
 
     echo "Erstelle Virtual Host für ${domain}..."
     echo "DocumentRoot: ${docroot}"
+    echo "PHP Version: ${php_version}"
     echo "SSH-User: ${ssh_user}"
 
-    # Erstelle übergeordnetes Verzeichnis und setze Berechtigungen
-    parent_dir=$(dirname "$docroot")
-    mkdir -p "$parent_dir"
-    chown "${ssh_user}:www-data" "$parent_dir"
-    chmod 775 "$parent_dir"
-    setfacl -m u:${ssh_user}:rwx,g:www-data:rwx "$parent_dir"
-    setfacl -d -m u:${ssh_user}:rwx,g:www-data:rwx "$parent_dir"
+    # Erstelle DocRoot-Struktur
+    if [ "$is_chroot" = true ]; then
+        add_chroot_docroot "$ssh_user" "$domain"
+    else
+        mkdir -p "${docroot}"
+        chown "${ssh_user}:www-data" "${docroot}"
+        chmod 750 "${docroot}"
 
-    # Erstelle DocRoot
-    mkdir -p "${docroot}"
+        # Setze ACLs für normale User
+        setfacl -R -m u:${ssh_user}:rwx,g:www-data:rwx "${docroot}"
+        setfacl -R -d -m u:${ssh_user}:rwx,g:www-data:rwx "${docroot}"
+    fi
 
     # Willkommens-Seite erstellen
     cat > "${docroot}/index.html" <<EOF
@@ -53,26 +110,45 @@ create_vhost() {
     <meta charset="UTF-8">
     <title>Willkommen auf ${domain}</title>
     <style>
-        body { font-family: Arial, sans-serif; margin: 40px auto; max-width: 800px; }
+        body {
+            font-family: Arial, sans-serif;
+            margin: 40px auto;
+            max-width: 800px;
+            line-height: 1.6;
+            padding: 0 20px;
+        }
+        pre {
+            background: #f4f4f4;
+            border: 1px solid #ddd;
+            padding: 15px;
+            border-radius: 4px;
+        }
     </style>
 </head>
 <body>
     <h1>Willkommen auf ${domain}!</h1>
     <p>Die Erstellung des vHosts hat erfolgreich funktioniert!</p>
-    <p>PHP Version: ${php_version}</p>
-    <p>Erstellt am: $(date +"%d.%m.%Y um %H:%M Uhr")</p>
+
+    <h2>Server-Informationen</h2>
+    <ul>
+        <li>PHP Version: ${php_version}</li>
+        <li>User-Typ: $([ "$is_chroot" = true ] && echo "Chroot" || echo "Standard")</li>
+        <li>Erstellt am: $(date +"%d.%m.%Y um %H:%M Uhr")</li>
+    </ul>
+
+    <h2>Verzeichnis-Informationen</h2>
+    <pre>
+DocumentRoot: ${docroot}
+$([ "$is_chroot" = true ] && echo "Im Chroot sichtbar als: /web/html/${domain}" || echo "")
+Berechtigungen: ${ssh_user}:www-data (750/640)
+    </pre>
 </body>
 </html>
 EOF
 
-    # Setze Basis-Besitzer und Berechtigungen für DocRoot
-    chown "${ssh_user}:www-data" "${docroot}"
-    chmod 775 "${docroot}"
-
-    # ACL für bestehende Dateien im DocRoot
-    setfacl -R -m u:${ssh_user}:rwx,g:www-data:rwx "${docroot}"
-    # Default-ACL für neue Dateien im DocRoot
-    setfacl -R -d -m u:${ssh_user}:rwx,g:www-data:rwx "${docroot}"
+    # Setze Berechtigungen für index.html
+    chown "${ssh_user}:www-data" "${docroot}/index.html"
+    chmod 640 "${docroot}/index.html"
 
     # Apache vHost Config erstellen
     cat > "/etc/apache2/sites-available/${domain}.conf" <<EOF
@@ -85,6 +161,9 @@ EOF
         Options Indexes FollowSymLinks MultiViews
         AllowOverride All
         Require all granted
+
+        # Verbesserte Sicherheit für Chroot-User
+        $([ "$is_chroot" = true ] && echo "php_admin_value open_basedir ${docroot}:/tmp")
     </Directory>
 
     <FilesMatch \.php$>
@@ -96,12 +175,16 @@ EOF
     Header always set X-Frame-Options "SAMEORIGIN"
     Header always set X-XSS-Protection "1; mode=block"
     Header always set Referrer-Policy "strict-origin-when-cross-origin"
+    Header always set Permissions-Policy "geolocation=(),midi=(),sync-xhr=(),microphone=(),camera=(),magnetometer=(),gyroscope=(),fullscreen=(self),payment=()"
+
+    # Content Security Policy
+    Header always set Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; frame-ancestors 'none'; form-action 'self'"
 
     # Logging
     ErrorLog \${APACHE_LOG_DIR}/${domain}_error.log
     CustomLog \${APACHE_LOG_DIR}/${domain}_access.log combined
 
-    # Optional: PHP-FPM Status
+    # PHP-FPM Status (nur lokal erreichbar)
     <Location /fpm-status>
         Require local
         SetHandler "proxy:unix:/run/php/php${php_version}-fpm.sock|fcgi://localhost"
@@ -109,23 +192,30 @@ EOF
 </VirtualHost>
 EOF
 
+    # Aktiviere vHost und Apache Module
+    a2enmod headers
     a2ensite "${domain}.conf"
     systemctl reload apache2
 
     echo "Virtual Host für ${domain} wurde erfolgreich erstellt!"
-    echo "Berechtigungen: ${ssh_user}:www-data (775/664) mit ACL"
+    if [ "$is_chroot" = true ]; then
+        echo "Chroot-User Setup:"
+        echo "- Echtes Verzeichnis: ${docroot}"
+        echo "- Im Chroot sichtbar als: /web/html/${domain}"
+    fi
+    echo "Berechtigungen: ${ssh_user}:www-data (750/640)"
 
     # Zeige finale Berechtigungen
-    echo -e "\nAktuelle Berechtigungen für ${parent_dir}:"
-    ls -la "${parent_dir}"
-    getfacl "${parent_dir}"
-
     echo -e "\nAktuelle Berechtigungen für ${docroot}:"
-    ls -la "${docroot}"
-    getfacl "${docroot}"
+    ls -ld "${docroot}"
+    ls -la "${docroot}/"
+
+    if [ "$is_chroot" = true ]; then
+        echo -e "\nZugriff im Chroot:"
+        ls -la "/var/www/jails/${ssh_user}/web/html/${domain}/"
+    fi
 }
 
-# Virtual Host löschen
 # Virtual Host löschen
 delete_vhost() {
     local domain=$1
@@ -204,11 +294,16 @@ list_vhosts() {
 change_php_version() {
     local domain=$1
     local php_version=$2
+    local config_file="/etc/apache2/sites-available/${domain}.conf"
 
-    if [ ! -f "/etc/apache2/sites-available/${domain}.conf" ]; then
+    if [ ! -f "$config_file" ]; then
         echo "Fehler: Virtual Host ${domain} existiert nicht!"
         return 1
     fi
+
+    # Extrahiere DocumentRoot und User aus der Apache-Konfiguration
+    local docroot=$(grep -i "DocumentRoot" "$config_file" | head -n1 | awk '{print $2}')
+    local user=$(stat -c '%U' "$docroot" 2>/dev/null)
 
     # Prüfe ob PHP-Version installiert ist
     if [ ! -S "/run/php/php${php_version}-fpm.sock" ]; then
@@ -216,11 +311,48 @@ change_php_version() {
         return 1
     fi
 
-    sed -i "s|proxy:unix:/run/php/php.*-fpm.sock|proxy:unix:/run/php/php${php_version}-fpm.sock|g" \
-        "/etc/apache2/sites-available/${domain}.conf"
+    # Prüfe ob es ein Chroot-User ist
+    local is_chroot=false
+    if [ -d "/var/www/jails/${user}" ]; then
+        is_chroot=true
+        echo "Info: Erkenne Chroot-User ${user}"
+    fi
+
+    # Apache Konfiguration aktualisieren
+    sed -i "s|proxy:unix:/run/php/php.*-fpm.sock|proxy:unix:/run/php/php${php_version}-fpm.sock|g" "$config_file"
+
+    # Wenn es ein Chroot-User ist, aktualisiere die PHP-Umgebung im Chroot
+    if [ "$is_chroot" = true ]; then
+        echo "Aktualisiere PHP-Umgebung im Chroot..."
+        local jail_root="/var/www/jails/${user}"
+
+        # PHP-Binaries und Extensions kopieren
+        echo "1/3 Kopiere PHP-Binaries..."
+        cp "/usr/bin/php${php_version}" "${jail_root}/usr/bin/" 2>/dev/null || true
+        ln -sf "/usr/bin/php${php_version}" "${jail_root}/usr/bin/php" 2>/dev/null || true
+
+        echo "2/3 Kopiere PHP-Extensions..."
+        # Erstelle Verzeichnisse falls sie nicht existieren
+        mkdir -p "${jail_root}/usr/lib/php/${php_version}"
+        cp -r "/usr/lib/php/${php_version}"/* "${jail_root}/usr/lib/php/${php_version}/" 2>/dev/null || true
+
+        echo "3/3 Aktualisiere Composer..."
+        if [ -f "${jail_root}/usr/local/bin/composer" ]; then
+            # Composer im Chroot aktualisieren
+            chroot "${jail_root}" /usr/local/bin/composer self-update
+        fi
+
+        echo "PHP-Umgebung im Chroot wurde aktualisiert!"
+    fi
 
     systemctl reload apache2
     echo "PHP Version für ${domain} wurde auf ${php_version} geändert!"
+
+    if [ "$is_chroot" = true ]; then
+        echo
+        echo "HINWEIS: Für Chroot-User wurde auch die PHP-Umgebung aktualisiert."
+        echo "Neue PHP-Version ist jetzt im Chroot verfügbar."
+    fi
 }
 
 # DocumentRoot eines vHosts ändern
@@ -310,9 +442,20 @@ vhost_menu() {
 
         case $choice in
             1)
-                # Zeige verfügbare SSH-User
                 echo "Verfügbare SSH-User:"
-                awk -F: '$7 ~ /\/bin\/bash/ || $7 ~ /\/bin\/rbash/ {print "- " $1}' /etc/passwd
+                echo "Standard-User:"
+                # Zeige nur nicht-Chroot User
+                awk -F: '$7 ~ /\/bin\/bash/ && $6 !~ /\/var\/www\/jails/ {print "- " $1}' /etc/passwd
+
+                echo -e "\nChroot-User:"
+                # Zeige nur existierende Chroot-User
+                if [ -d "/var/www/jails" ]; then
+                    find "/var/www/jails" -maxdepth 1 -mindepth 1 -type d -exec basename {} \; | while read user; do
+                        if id "$user" &>/dev/null; then
+                            echo "- $user (chroot)"
+                        fi
+                    done
+                fi
 
                 read -p "SSH-User: " ssh_user
                 if ! id "$ssh_user" >/dev/null 2>&1; then
@@ -323,7 +466,14 @@ vhost_menu() {
                 read -p "Domain: " domain
                 read -p "Aliases (space-separated): " aliases
                 read -p "PHP Version (z.B. 8.2): " php_version
-                read -p "Custom DocumentRoot (leer für Standard): " custom_docroot
+
+                if [ ! -d "/var/www/jails/${ssh_user}" ]; then
+                    read -p "Custom DocumentRoot (leer für Standard): " custom_docroot
+                else
+                    echo "Info: Custom DocumentRoot wird für Chroot-User ignoriert"
+                    custom_docroot=""
+                fi
+
                 create_vhost "$domain" "$aliases" "$php_version" "$custom_docroot" "$ssh_user"
                 ;;
             2)
@@ -336,7 +486,24 @@ vhost_menu() {
                 list_vhosts
                 ;;
             4)
+                list_vhosts
+                echo
                 read -p "Domain: " domain
+                if [ ! -f "/etc/apache2/sites-available/${domain}.conf" ]; then
+                    echo "Fehler: Domain existiert nicht!"
+                    continue
+                fi
+
+                echo "Verfügbare PHP Versionen:"
+                for version in /usr/bin/php[0-9]*; do
+                    if [ -f "$version" ]; then
+                        ver=$(basename "$version" | sed 's/php//')
+                        if [ -S "/run/php/php${ver}-fpm.sock" ]; then
+                            echo "- PHP $ver"
+                        fi
+                    fi
+                done
+                echo
                 read -p "Neue PHP Version (z.B. 8.2): " php_version
                 change_php_version "$domain" "$php_version"
                 ;;

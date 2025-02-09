@@ -154,56 +154,163 @@ create_secure_chroot_user() {
     # Basis-Verzeichnisstruktur
     local jail_root="/var/www/jails/${username}"
 
-    # Erstelle notwendige Verzeichnisse
+    # 1. Erstelle Web-Verzeichnisstruktur
+    echo "1/5 Erstelle Web-Verzeichnisstruktur..."
     mkdir -p "${web_root}"
+    mkdir -p "${web_root}/html"
+    mkdir -p "${web_root}/logs"
+    mkdir -p "${web_root}/tmp"
+
+    # 2. Erstelle Jail-Verzeichnis
+    echo "2/5 Erstelle Jail-Verzeichnis..."
     mkdir -p "${jail_root}"
 
-    # Erstelle User mit chroot Shell
+    # 3. Erstelle User mit Bash als Shell
+    echo "3/5 Erstelle User..."
     useradd -d "${jail_root}" \
             -g www-data \
-            -s /usr/sbin/jk_chrootsh \
+            -s /bin/bash \
             "${username}"
 
     # Setze Passwort
     echo "${username}:${password}" | chpasswd
 
-    # Installiere jailkit falls nicht vorhanden
-    if ! command -v jk_init &> /dev/null; then
-        apt-get update && apt-get install -y jailkit
+    # 4. Erstelle notwendige Verzeichnisse für Shell-Zugriff
+    echo "4/5 Erstelle Shell-Umgebung..."
+
+    # Erstelle grundlegende Verzeichnisstruktur
+    mkdir -p "${jail_root}"/{dev,etc,bin,lib,lib64,usr/bin,usr/lib}
+    mkdir -p "${jail_root}/dev/pts"
+    mkdir -p "${jail_root}/dev/shm"
+    mkdir -p "${jail_root}/var/www/${username}"
+
+    # Füge Mount-Einträge zu fstab hinzu wenn nicht vorhanden
+    local fstab_modified=0
+
+    if ! grep -q "${jail_root}/dev/pts" /etc/fstab; then
+        echo "devpts ${jail_root}/dev/pts devpts gid=5,mode=620 0 0" >> /etc/fstab
+        fstab_modified=1
     fi
 
-    # Initialisiere chroot mit benötigten Tools
-    jk_init -v "${jail_root}" basicshell editors extendedshell git ssh sftp scp rsync
+    if ! grep -q "${jail_root}/dev/shm" /etc/fstab; then
+        echo "tmpfs ${jail_root}/dev/shm tmpfs defaults 0 0" >> /etc/fstab
+        fstab_modified=1
+    fi
 
-    # Kopiere zusätzliche Bibliotheken
-    mkdir -p "${jail_root}/usr/lib/x86_64-linux-gnu/"
-    cp /usr/lib/x86_64-linux-gnu/libssl.so* "${jail_root}/usr/lib/x86_64-linux-gnu/"
-    cp /usr/lib/x86_64-linux-gnu/libcrypto.so* "${jail_root}/usr/lib/x86_64-linux-gnu/"
+    if ! grep -q "${web_root} ${jail_root}/var/www/${username}" /etc/fstab; then
+        echo "${web_root} ${jail_root}/var/www/${username} none bind 0 0" >> /etc/fstab
+        fstab_modified=1
+    fi
 
-    # Web-Verzeichnis Berechtigungen
+    # Lade systemd neu, wenn fstab geändert wurde
+    if [ $fstab_modified -eq 1 ]; then
+        systemctl daemon-reload
+    fi
+
+    # Mounte die Verzeichnisse
+    mount -t devpts devpts "${jail_root}/dev/pts" -o gid=5,mode=620
+    mount -t tmpfs tmpfs "${jail_root}/dev/shm"
+    mount --bind "${web_root}" "${jail_root}/var/www/${username}"
+
+    # Erstelle /dev/null und /dev/urandom wenn nicht vorhanden
+    if [ ! -e "${jail_root}/dev/null" ]; then
+        mknod "${jail_root}/dev/null" c 1 3
+        chmod 666 "${jail_root}/dev/null"
+    fi
+    if [ ! -e "${jail_root}/dev/urandom" ]; then
+        mknod "${jail_root}/dev/urandom" c 1 9
+        chmod 666 "${jail_root}/dev/urandom"
+    fi
+
+    # Kopiere grundlegende Befehle
+    BASIC_COMMANDS=(
+        "/bin/bash"
+        "/bin/ls"
+        "/bin/cp"
+        "/bin/mv"
+        "/bin/rm"
+        "/bin/mkdir"
+        "/bin/rmdir"
+        "/bin/chmod"
+        "/bin/chown"
+        "/bin/cat"
+        "/bin/grep"
+        "/bin/pwd"
+        "/usr/bin/id"
+        "/usr/bin/whoami"
+        "/usr/bin/groups"
+        "/usr/bin/touch"
+    )
+
+    for cmd in "${BASIC_COMMANDS[@]}"; do
+        if [ -f "$cmd" ]; then
+            cp "$cmd" "${jail_root}${cmd}"
+            # Kopiere abhängige Bibliotheken
+            ldd "$cmd" | grep -o '/lib.*\.so[^ ]*' | while read lib; do
+                mkdir -p "${jail_root}/$(dirname "$lib")"
+                cp "$lib" "${jail_root}$lib"
+            done
+        fi
+    done
+
+    # 5. Erstelle Verzeichnisstruktur und setze Berechtigungen
+    echo "5/5 Setze finale Struktur und Berechtigungen..."
+
+    # Berechtigungen für Web-Verzeichnis
     chown -R "${username}:www-data" "${web_root}"
-    chmod 750 "${web_root}"
+    find "${web_root}" -type d -exec chmod 750 {} \;
+    find "${web_root}" -type f -exec chmod 640 {} \;
 
-    # SSH Setup im Jail
+    # Erstelle relativen Symlink
+    ln -sfn "var/www/${username}" "${jail_root}/web"
+    chown -h "${username}:www-data" "${jail_root}/web"
+
+    # SSH Setup
     mkdir -p "${jail_root}/.ssh"
     chmod 700 "${jail_root}/.ssh"
     touch "${jail_root}/.ssh/authorized_keys"
     chmod 600 "${jail_root}/.ssh/authorized_keys"
     chown -R "${username}:www-data" "${jail_root}/.ssh"
 
-    # Erstelle Web-Verzeichnis Link im Jail
-    ln -s "${web_root}" "${jail_root}/web"
-
     # SSH Konfiguration
-    cat >> /etc/ssh/sshd_config << EOF
+    local ssh_config="/etc/ssh/sshd_config"
+
+    # Prüfe und setze globale Subsystem-Konfiguration
+    if ! grep -q "^Subsystem.*sftp.*internal-sftp" "$ssh_config"; then
+        # Entferne alte sftp Subsystem-Konfiguration falls vorhanden
+        sed -i '/^Subsystem.*sftp/d' "$ssh_config"
+        # Füge neue Konfiguration hinzu
+        sed -i '1iSubsystem sftp internal-sftp' "$ssh_config"
+    fi
+
+    # Entferne existierende Match-Block-Konfiguration für diesen User falls vorhanden
+    sed -i "/Match User ${username}/,+10d" "$ssh_config"
+
+    # Füge neue User-spezifische Konfiguration hinzu
+    cat >> "$ssh_config" << EOF
 
 # Secure Chroot Config für ${username}
 Match User ${username}
     ChrootDirectory ${jail_root}
     X11Forwarding no
     AllowTcpForwarding no
-    ForceCommand internal-sftp
+    PermitTunnel no
+    AllowAgentForwarding no
 EOF
+
+    # Teste SSH-Konfiguration
+    if ! sshd -t; then
+        echo "Fehler: SSH-Konfiguration ist ungültig!"
+        # Stelle Backup wieder her falls vorhanden
+        if [ -f "${ssh_config}.bak" ]; then
+            mv "${ssh_config}.bak" "$ssh_config"
+            systemctl restart sshd
+        fi
+        return 1
+    fi
+
+    # Starte SSH neu
+    systemctl restart sshd
 
     # .bashrc im Jail
     cat > "${jail_root}/.bashrc" << EOF
@@ -213,18 +320,422 @@ alias ll='ls -la'
 cd /web
 EOF
 
-    # Finale Berechtigungen
+    # Finale Berechtigungen für Jail
     chown root:root "${jail_root}"
     chmod 755 "${jail_root}"
-
-    # Neustart SSH
-    systemctl restart sshd
 
     echo "=== Chroot-User Setup abgeschlossen ==="
     echo "Web-Verzeichnis: ${web_root}"
     echo "Jail-Verzeichnis: ${jail_root}"
     echo "SSH-Zugriff: ssh -p 62954 ${username}@domain"
     echo "SFTP-Zugriff: sftp -P 62954 ${username}@domain"
+
+    # Zeige Verzeichnisstruktur
+    echo -e "\nVerzeichnisstruktur:"
+    echo "Real:"
+    tree -L 2 "${web_root}"
+    echo -e "\nJail:"
+    ls -la "${jail_root}/web"
+}
+
+add_chroot_docroot() {
+    local username=$1
+    local domain=$2
+
+    if [ -z "$username" ] || [ -z "$domain" ]; then
+        echo "Fehler: Username und Domain müssen angegeben werden!"
+        return 1
+    fi
+
+    # Prüfe ob es ein Chroot-User ist
+    if [ ! -d "/var/www/jails/${username}" ]; then
+        echo "Fehler: ${username} ist kein Chroot-User!"
+        return 1
+    fi
+
+    local web_root="/var/www/${username}"
+    local docroot="${web_root}/html/${domain}"
+
+    echo "Erstelle DocRoot für ${domain}..."
+
+    # Erstelle Domain-Verzeichnis
+    mkdir -p "${docroot}"
+    chown "${username}:www-data" "${docroot}"
+    chmod 750 "${docroot}"
+
+    # Der Link wird automatisch durch den existierenden /web Symlink aufgelöst
+    echo "DocRoot Setup abgeschlossen"
+    echo "Realer Pfad: ${docroot}"
+    echo "Im Chroot sichtbar als: /web/html/${domain}"
+
+    return 0
+}
+
+delete_chroot_user() {
+    local username=$1
+
+    echo "Lösche Chroot-User: $username"
+
+    # Pfade
+    local web_root="/var/www/${username}"
+    local jail_root="/var/www/jails/${username}"
+
+    # Prüfe ob der User existiert
+    if ! id "$username" &>/dev/null; then
+        echo "Fehler: User ${username} existiert nicht!"
+        return 1
+    fi
+
+    # Prüfe ob es ein Chroot-User ist
+    if [ ! -d "$jail_root" ]; then
+        echo "Fehler: ${username} ist kein Chroot-User!"
+        return 1
+    fi
+
+    # Backup erstellen
+    local backup_dir="/root/user_backups"
+    mkdir -p "${backup_dir}"
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+
+    echo "Erstelle Backup..."
+    tar czf "${backup_dir}/${username}_backup_${timestamp}.tar.gz" "${web_root}" 2>/dev/null
+
+    # Beende alle Prozesse des Users
+    echo "Beende aktive Prozesse..."
+    pkill -u "${username}" || true
+    sleep 2
+
+    # Unmounte alle Verzeichnisse
+    echo "Unmounte Verzeichnisse..."
+
+    # Unmount in spezifischer Reihenfolge
+    local mount_points=(
+        "${jail_root}/var/www/${username}"  # Web-Verzeichnis zuerst
+        "${jail_root}/dev/pts"              # dann pts
+        "${jail_root}/dev/shm"              # dann shm
+    )
+
+    for mount_point in "${mount_points[@]}"; do
+        if mount | grep -q " $mount_point "; then
+            echo "Unmounte $mount_point"
+            umount -f "$mount_point" 2>/dev/null || umount -l "$mount_point" 2>/dev/null
+            sleep 1
+        fi
+    done
+
+    # Zusätzliche Sicherheit: Prüfe auf verbliebene Mounts
+    local remaining_mounts=$(mount | grep "${jail_root}" | awk '{print $3}')
+    if [ ! -z "$remaining_mounts" ]; then
+        echo "Unmounte verbliebene Mountpoints..."
+        echo "$remaining_mounts" | while read mount_point; do
+            umount -f "$mount_point" 2>/dev/null || umount -l "$mount_point" 2>/dev/null
+            sleep 1
+        done
+    fi
+
+    # Entferne fstab Einträge
+    echo "Entferne fstab Einträge..."
+    sed -i "\#${jail_root}#d" /etc/fstab
+
+    # Lade systemd neu nach fstab Änderungen
+    systemctl daemon-reload
+
+    # User entfernen
+    echo "Lösche User..."
+    userdel -f "${username}" 2>/dev/null
+    sleep 1
+
+    # Versuche mehrmals die Verzeichnisse zu löschen
+    echo "Lösche Verzeichnisse..."
+    local max_attempts=3
+    local attempt=1
+
+    while [ $attempt -le $max_attempts ]; do
+        echo "Versuch $attempt von $max_attempts..."
+
+        # Prüfe erst, ob noch Mounts existieren
+        if mount | grep -q "${jail_root}"; then
+            echo "Es existieren noch Mounts, versuche erneut zu unmounten..."
+            mount | grep "${jail_root}" | awk '{print $3}' | while read mount_point; do
+                umount -f "$mount_point" 2>/dev/null || umount -l "$mount_point" 2>/dev/null
+            done
+            sleep 2
+        fi
+
+        # Versuche zu löschen
+        if rm -rf "${web_root}" "${jail_root}" 2>/dev/null; then
+            echo "Verzeichnisse erfolgreich gelöscht!"
+            break
+        else
+            echo "Löschen fehlgeschlagen, warte kurz..."
+            sleep 3
+            attempt=$((attempt + 1))
+        fi
+    done
+
+    if [ $attempt -gt $max_attempts ]; then
+        echo "WARNUNG: Konnte nicht alle Verzeichnisse löschen!"
+        echo "Bitte prüfen Sie manuell:"
+        echo "- ${web_root}"
+        echo "- ${jail_root}"
+    fi
+
+    # SSH-Config entfernen
+    echo "Entferne SSH-Konfiguration..."
+    sed -i "/# Secure Chroot Config für ${username}/,+6d" /etc/ssh/sshd_config
+
+    # SSH neu starten wenn Konfiguration valide ist
+    if sshd -t; then
+        systemctl restart sshd
+    else
+        echo "WARNUNG: SSH-Konfiguration scheint beschädigt zu sein!"
+        echo "Bitte überprüfen Sie die Konfiguration manuell."
+    fi
+
+    if [ -d "${jail_root}" ]; then
+        echo "WARNUNG: Jail-Verzeichnis existiert noch: ${jail_root}"
+        echo "Sie können versuchen, den Server neu zu starten und dann manuell zu löschen:"
+        echo "rm -rf ${jail_root}"
+    fi
+
+    echo "Chroot-User wurde gelöscht!"
+    echo "Backup erstellt: ${backup_dir}/${username}_backup_${timestamp}.tar.gz"
+}
+
+install_chroot_dev_tools() {
+    local username=$1
+    local jail_root="/var/www/jails/${username}"
+
+    if [ ! -d "$jail_root" ]; then
+        echo "Fehler: Chroot-Verzeichnis für ${username} existiert nicht!"
+        return 1
+    fi
+
+    echo "Installiere Entwickler-Tools für Chroot-User ${username}..."
+
+    # Erstelle notwendige Verzeichnisse
+    mkdir -p "${jail_root}/usr/local/bin"
+    mkdir -p "${jail_root}/usr/lib/node_modules"
+    mkdir -p "${jail_root}/.composer"
+    mkdir -p "${jail_root}/tmp"
+    mkdir -p "${jail_root}/dev"
+
+    # Composer installieren
+    echo "1/6 Installiere Composer..."
+    if [ ! -f "/usr/local/bin/composer" ]; then
+        EXPECTED_CHECKSUM="$(php -r 'copy("https://composer.github.io/installer.sig", "php://stdout");')"
+        php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');"
+        ACTUAL_CHECKSUM="$(php -r "echo hash_file('sha384', 'composer-setup.php');")"
+
+        if [ "$EXPECTED_CHECKSUM" != "$ACTUAL_CHECKSUM" ]; then
+            rm composer-setup.php
+            echo 'Composer Installer korrupt'
+            return 1
+        fi
+
+        php composer-setup.php --install-dir=/usr/local/bin --filename=composer
+        rm composer-setup.php
+    fi
+    cp /usr/local/bin/composer "${jail_root}/usr/local/bin/"
+    chmod +x "${jail_root}/usr/local/bin/composer"
+
+    # PHP und Extensions
+    echo "2/6 Kopiere PHP und Extensions..."
+    mkdir -p "${jail_root}/usr/bin"
+    cp /usr/bin/php* "${jail_root}/usr/bin/" 2>/dev/null || true
+    mkdir -p "${jail_root}/usr/lib/php"
+    cp -r /usr/lib/php/* "${jail_root}/usr/lib/php/" 2>/dev/null || true
+
+    # Node.js und NPM (Optional)
+    echo "3/6 Installiere Node.js Basis..."
+    if command -v node >/dev/null; then
+        cp $(which node) "${jail_root}/usr/bin/"
+        cp $(which npm) "${jail_root}/usr/bin/"
+    fi
+
+    # Symfony CLI (Optional)
+    echo "4/6 Installiere Symfony CLI..."
+    if command -v symfony >/dev/null; then
+        cp $(which symfony) "${jail_root}/usr/local/bin/"
+        chmod +x "${jail_root}/usr/local/bin/symfony"
+    fi
+
+    # Zusätzliche Entwickler-Tools
+    echo "5/6 Kopiere zusätzliche Entwickler-Tools..."
+    local dev_tools=(
+        "git" "curl" "wget" "unzip" "tar" "gzip"
+        "nano" "vim" "grep" "awk" "sed"
+    )
+
+    for tool in "${dev_tools[@]}"; do
+        if [ -f "/usr/bin/$tool" ]; then
+            cp "/usr/bin/$tool" "${jail_root}/usr/bin/"
+        fi
+    done
+
+    # Symfony und allgemeine Entwicklungs-Bibliotheken
+    echo "6/6 Kopiere Bibliotheken..."
+    local dev_libs=(
+        "libicu*"
+        "libxml2*"
+        "libxslt*"
+        "libzip*"
+        "libsqlite3*"
+        "libonig*"
+        "libcurl*"
+        "libssl*"
+        "libcrypto*"
+        "libbz2*"
+        "libreadline*"
+        "libncurses*"
+        "libtinfo*"
+        "libstdc++*"
+        "libgcc_s*"
+        "libc.*"
+        "libintl*"
+        "libyaml*"
+        "libpcre*"
+        "libmagic*"
+        "libsasl*"
+        "libgssapi*"
+        "libkrb5*"
+        "libk5crypto*"
+        "libcom_err*"
+        "liblzma*"
+        "libffi*"
+        "libpng*"
+        "libjpeg*"
+        "libfreetype*"
+        "libmemcached*"
+        "libldap*"
+        "libpq*"
+    )
+
+    for lib in "${dev_libs[@]}"; do
+        mkdir -p "${jail_root}/lib/x86_64-linux-gnu/"
+        cp /lib/x86_64-linux-gnu/${lib} "${jail_root}/lib/x86_64-linux-gnu/" 2>/dev/null || true
+        mkdir -p "${jail_root}/usr/lib/x86_64-linux-gnu/"
+        cp /usr/lib/x86_64-linux-gnu/${lib} "${jail_root}/usr/lib/x86_64-linux-gnu/" 2>/dev/null || true
+    done
+
+    # Erstelle /dev/null und /dev/urandom wenn nicht vorhanden
+    if [ ! -e "${jail_root}/dev/null" ]; then
+        mknod "${jail_root}/dev/null" c 1 3
+        chmod 666 "${jail_root}/dev/null"
+    fi
+    if [ ! -e "${jail_root}/dev/urandom" ]; then
+        mknod "${jail_root}/dev/urandom" c 1 9
+        chmod 666 "${jail_root}/dev/urandom"
+    fi
+
+    # Composer Konfiguration für Symfony
+    cat > "${jail_root}/.composer/composer.json" <<EOF
+{
+    "config": {
+        "bin-dir": "vendor/bin",
+        "allow-plugins": {
+            "symfony/flex": true,
+            "symfony/runtime": true,
+            "php-http/discovery": true
+        },
+        "optimize-autoloader": true,
+        "preferred-install": {
+            "*": "dist"
+        },
+        "sort-packages": true
+    }
+}
+EOF
+
+    # Entwickler .bashrc mit Symfony-Support
+    cat > "${jail_root}/.bashrc" <<EOF
+# Basis PATH
+export PATH=/usr/local/bin:/usr/bin:/bin:/home/${username}/bin
+
+# Entwickler Aliase
+alias ll='ls -la'
+alias la='ls -la'
+alias l='ls -CF'
+alias composer='COMPOSER_ALLOW_SUPERUSER=1 composer'
+alias sf='php bin/console'
+alias sfcc='php bin/console cache:clear'
+alias sfserve='php -S 0.0.0.0:8000 -t public'
+alias sfperms='find . -type f -exec chmod 664 {} \; && find . -type d -exec chmod 775 {} \;'
+
+# Git Aliase
+alias gs='git status'
+alias ga='git add'
+alias gc='git commit'
+alias gp='git push'
+alias gl='git pull'
+
+# Composer Environment
+export COMPOSER_HOME="/home/${username}/.composer"
+export PATH="\$PATH:/web/vendor/bin"
+
+# PHP Settings für Entwicklung
+export APP_ENV=dev
+alias php='php -d memory_limit=-1'
+
+# Node.js Environment (wenn installiert)
+if [ -f /usr/bin/node ]; then
+    export NODE_PATH="/usr/lib/node_modules"
+fi
+
+# Symfony Environment
+export SYMFONY_ENV=dev
+export SYMFONY_DEBUG=1
+
+# Standard Verzeichnis
+cd /web
+EOF
+
+    # Cache- und Log-Verzeichnisse
+    mkdir -p "${jail_root}/tmp/symfony-cache"
+    mkdir -p "${jail_root}/tmp/symfony-logs"
+    chown -R "${username}:www-data" "${jail_root}/tmp"
+    chmod -R 775 "${jail_root}/tmp"
+
+    # Setze finale Berechtigungen
+    chown -R "${username}:www-data" "${jail_root}/.composer"
+    chown "${username}:www-data" "${jail_root}/.bashrc"
+    chmod 755 "${jail_root}/usr/local/bin/composer"
+
+    echo "============================================"
+    echo "Entwickler-Tools wurden erfolgreich installiert!"
+    echo "============================================"
+    echo "Verfügbare Tools:"
+    echo "- Composer (global installiert)"
+    echo "- PHP und Extensions"
+    echo "- Git, Curl, Wget, etc."
+    if command -v node >/dev/null; then
+        echo "- Node.js und NPM"
+    fi
+    if command -v symfony >/dev/null; then
+        echo "- Symfony CLI"
+    fi
+    echo
+    echo "Symfony Features:"
+    echo "- Composer mit Symfony Flex Support"
+    echo "- Symfony Console Aliase (sf, sfcc, sfserve)"
+    echo "- Cache & Log Verzeichnisse"
+    echo "- Optimierte PHP-Einstellungen"
+    echo
+    echo "Nützliche Aliase:"
+    echo "- sf       (symfony console)"
+    echo "- sfcc     (cache clear)"
+    echo "- sfserve  (development server)"
+    echo "- sfperms  (fix permissions)"
+    echo
+    echo "Um ein neues Symfony-Projekt zu erstellen:"
+    echo "1. ssh -p 62954 ${username}@domain"
+    echo "2. cd /web/html/deine-domain"
+    echo "3. composer create-project symfony/skeleton ."
+    echo "   oder"
+    echo "   composer create-project symfony/website-skeleton ."
+    echo
+    echo "HINWEIS: Bei Berechtigungsproblemen:"
+    echo "cd /web/html/deine-domain && sfperms"
 }
 
 # Standard SSH User erstellen
@@ -409,7 +920,8 @@ delete_chroot_user() {
 list_ssh_users() {
     echo "=== SSH User ==="
     echo "Standard und Entwickler User:"
-    awk -F: '$7 ~ /\/bin\/bash/ {print "- " $1}' /etc/passwd
+    # Zeige nur nicht-Chroot User
+    awk -F: '$7 ~ /\/bin\/bash/ && $6 !~ /\/var\/www\/jails/ {print "- " $1}' /etc/passwd
 
     # Prüfe auf Chroot-User nur wenn das Verzeichnis existiert
     if [ -d "/var/www/jails" ]; then
@@ -420,10 +932,55 @@ list_ssh_users() {
             echo
             echo "Chroot User:"
             find "/var/www/jails" -maxdepth 1 -mindepth 1 -type d -exec basename {} \; | while read user; do
-                echo "- $user (chroot)"
+                if id "$user" &>/dev/null; then
+                    echo "- $user (chroot)"
+                else
+                    # Aufräumen: Entferne verwaiste Chroot-Verzeichnisse
+                    echo "- $user (verwaist, wird aufgeräumt)"
+                    local jail_root="/var/www/jails/$user"
+
+                    # Unmounte in definierter Reihenfolge
+                    for mount_point in "${jail_root}/var/www/$user" "${jail_root}/dev/pts" "${jail_root}/dev/shm"; do
+                        if mount | grep -q " $mount_point "; then
+                            echo "  Unmounte $mount_point"
+                            umount -f "$mount_point" 2>/dev/null || umount -l "$mount_point" 2>/dev/null
+                            sleep 1
+                        fi
+                    done
+
+                    # Entferne fstab Einträge
+                    sed -i "\#${jail_root}#d" /etc/fstab
+                    systemctl daemon-reload
+
+                    # Warte kurz
+                    sleep 2
+
+                    # Versuche das Verzeichnis zu löschen
+                    rm -rf "/var/www/jails/$user" "/var/www/$user" 2>/dev/null
+                fi
             done
         fi
     fi
+}
+
+# Hilfsfunktion zum Unmounten aller Verzeichnisse eines Users
+unmount_user_directories() {
+    local username=$1
+    local jail_root="/var/www/jails/${username}"
+
+    # Finde und unmounte alle Mounts in umgekehrter Reihenfolge
+    mount | grep "${jail_root}" | awk '{print $3}' | sort -r | while read mount_point; do
+        echo "Unmounte $mount_point"
+        umount -f "$mount_point" 2>/dev/null || umount -l "$mount_point" 2>/dev/null
+    done
+
+    # Warte kurz
+    sleep 2
+
+    # Entferne fstab Einträge
+    sed -i "\#${jail_root}#d" /etc/fstab
+
+    return 0
 }
 
 # Hilfsfunktionen für SSH Key Management
@@ -614,23 +1171,25 @@ ssh_menu() {
     local submenu=true
 
     while $submenu; do
-        clear
-        echo "=== SSH User Management ==="
-        echo "1. Standard SSH-User erstellen"
-        echo "2. Entwickler SSH-User erstellen"
-        echo "3. Secure Chroot-User erstellen (ISPConfig-Style)"
-        echo "4. SSH-User löschen"
-        echo "5. SSH-User anzeigen"
-        echo "6. SSH-Key zu bestehendem User hinzufügen"
-        echo "7. Neuen SSH-Key für User generieren"
-        echo "8. SSH-Keys eines Users anzeigen"
-        echo "9. User zu Entwickler-Account upgraden"
-        echo "10. DocRoots verwalten"
-        echo "11. DocRoot-Berechtigungen reparieren"
-        echo "12. ACL-Berechtigungen reparieren"
-        echo "13. Zurück zum Hauptmenü"
-        echo
-        read -r -p "Wähle eine Option (1-13): " choice
+            clear
+            echo "=== SSH User Management ==="
+            echo "1. Standard SSH-User erstellen"
+            echo "2. Entwickler SSH-User erstellen"
+            echo "3. Secure Chroot-User erstellen (ISPConfig-Style)"
+            echo "4. SSH-User löschen"
+            echo "5. SSH-User anzeigen"
+            echo "6. SSH-Key zu bestehendem User hinzufügen"
+            echo "7. Neuen SSH-Key für User generieren"
+            echo "8. SSH-Keys eines Users anzeigen"
+            echo "9. User zu Entwickler-Account upgraden"
+            echo "10. DocRoots verwalten"
+            echo "11. DocRoot-Berechtigungen reparieren"
+            echo "12. ACL-Berechtigungen reparieren"
+            echo "13. Entwickler-Tools für Chroot-User installieren"
+            echo "14. Chroot-Struktur prüfen/reparieren"
+            echo "15. Zurück zum Hauptmenü"
+            echo
+            read -r -p "Wähle eine Option (1-15): " choice
 
         case $choice in
             1)
@@ -661,14 +1220,54 @@ ssh_menu() {
                 ;;
             4)
                 echo
+                echo "=== SSH User löschen ==="
                 list_ssh_users
                 echo
                 read -p "Username zum Löschen (oder 'q' für abbrechen): " username
                 [ "$username" = "q" ] && continue
 
+                if ! id "$username" &>/dev/null; then
+                    echo "Fehler: User ${username} existiert nicht!"
+                    read -p "Enter drücken zum Fortfahren..."
+                    continue
+                fi
+
                 # Prüfe ob es ein Chroot-User ist
                 if [ -d "/var/www/jails/$username" ]; then
-                    delete_chroot_user "$username"
+                    read -p "ACHTUNG: Chroot-User ${username} wird gelöscht! Fortfahren? (j/N): " confirm
+                    if [[ "$confirm" == "j" || "$confirm" == "J" ]]; then
+                        # Unmounte erst alle Verzeichnisse
+                        local jail_root="/var/www/jails/${username}"
+
+                        echo "Unmounte Verzeichnisse..."
+
+                        # Definierte Reihenfolge für Unmounts
+                        local mount_points=(
+                            "${jail_root}/var/www/${username}"
+                            "${jail_root}/dev/pts"
+                            "${jail_root}/dev/shm"
+                        )
+
+                        for mount_point in "${mount_points[@]}"; do
+                            if mount | grep -q " $mount_point "; then
+                                echo "Unmounte $mount_point"
+                                umount -f "$mount_point" 2>/dev/null || umount -l "$mount_point" 2>/dev/null
+                                sleep 1
+                            fi
+                        done
+
+                        # Warte kurz
+                        sleep 2
+
+                        # Entferne fstab Einträge
+                        sed -i "\#${jail_root}#d" /etc/fstab
+                        systemctl daemon-reload
+
+                        # Jetzt erst den User löschen
+                        delete_chroot_user "$username"
+                    else
+                        echo "Abbruch durch Benutzer."
+                    fi
                 else
                     delete_ssh_user "$username"
                 fi
@@ -759,15 +1358,70 @@ ssh_menu() {
                 read -p "Enter drücken zum Fortfahren..."
                 ;;
             13)
+                echo "=== Chroot Entwickler-Tools Installation ==="
+                echo "Verfügbare Chroot-User:"
+                found_users=false
+                for user in /var/www/jails/*; do
+                    if [ -d "$user" ]; then
+                        echo "- $(basename "$user")"
+                        found_users=true
+                    fi
+                done
+
+                if [ "$found_users" = false ]; then
+                    echo "Keine Chroot-User gefunden!"
+                    read -p "Enter drücken zum Fortfahren..."
+                    continue
+                fi
+
+                echo
+                read -p "Username (oder 'q' für abbrechen): " username
+                [ "$username" = "q" ] && continue
+
+                if [ ! -d "/var/www/jails/$username" ]; then
+                    echo "Fehler: Kein Chroot-User mit diesem Namen gefunden!"
+                else
+                    install_chroot_dev_tools "$username"
+                fi
+                ;;
+
+            14)
+                echo "=== Chroot-Verwaltung ==="
+                echo "Verfügbare Chroot-User:"
+                for user in /var/www/jails/*; do
+                    if [ -d "$user" ]; then
+                        echo "- $(basename "$user")"
+                    fi
+                done
+                echo
+                read -p "Username (oder 'q' für abbrechen): " username
+                [ "$username" = "q" ] && continue
+
+                if [ ! -d "/var/www/jails/$username" ]; then
+                    echo "Fehler: Kein Chroot-User mit diesem Namen gefunden!"
+                    read -p "Enter drücken zum Fortfahren..."
+                    continue
+                fi
+
+                verify_chroot_structure "$username"
+                echo
+                read -p "Soll die Chroot-Struktur repariert werden? (j/N): " repair
+                if [[ "$repair" == "j" || "$repair" == "J" ]]; then
+                    repair_chroot_setup "$username"
+                fi
+                ;;
+
+            15)
                 submenu=false
                 continue
                 ;;
+
             *)
                 echo "Ungültige Option!"
                 ;;
         esac
 
-        if [ "$choice" != "13" ]; then
+        if [ "$choice" != "14" ]; then
             echo
             read -p "Enter drücken zum Fortfahren..."
             clear
